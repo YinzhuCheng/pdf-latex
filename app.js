@@ -854,6 +854,16 @@ function buildOrganizerPrompt({ windowPages }) {
   ]
 }
 
+严格规则：
+1) 章节结构只能基于输入里 headings 的显式证据，不得新增不存在的标题。
+2) 如果没有足够证据，宁可不分章。
+3) latex_body 必须按页顺序包含所有页的内容（可插入 \\section 等），并保留每页边界注释。
+
+输入 windowPages（JSON）：
+${JSON.stringify(windowPages, null, 2)}
+`;
+}
+
 function buildWindowPlanPrompt({ windowPages }) {
   return `
 你在做“滑动窗口初步组装”（先转写后组织）。输入是一组连续页的转写结果（含 headings 显式证据）。
@@ -875,16 +885,6 @@ function buildWindowPlanPrompt({ windowPages }) {
 1) insertions 只能基于输入里 headings 的显式证据，不得新增不存在的标题。
 2) 如证据不足，宁可输出空 insertions。
 3) page 必须是窗口内页码之一。
-
-输入 windowPages（JSON）：
-${JSON.stringify(windowPages, null, 2)}
-`;
-}
-
-严格规则：
-1) 章节结构只能基于输入里 headings 的显式证据，不得新增不存在的标题。
-2) 如果没有足够证据，宁可不分章。
-3) latex_body 必须按页顺序包含所有页的内容（可插入 \\section 等），并保留每页边界注释。
 
 输入 windowPages（JSON）：
 ${JSON.stringify(windowPages, null, 2)}
