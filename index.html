@@ -437,6 +437,20 @@
 
     <!-- jszip -->
     <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+    <script>
+      // Minimal healthcheck: if the app module fails to load, show a visible hint.
+      setTimeout(() => {
+        try {
+          if (!window.__APP_READY__) {
+            const box = document.getElementById("logBox");
+            if (box) {
+              box.textContent +=
+                "\n[BOOT] App did not start. Open DevTools Console/Network to see why (often blocked module import / wrong MIME / 404).\n";
+            }
+          }
+        } catch (_) {}
+      }, 1500);
+    </script>
     <script type="module" src="./app.js"></script>
   </body>
 </html>

@@ -1,6 +1,6 @@
 /* eslint-disable no-console */
 
-import * as pdfjsLib from "./vendor/pdfjs/pdf.min.js";
+let pdfjsLib = null;
 
 // ---------------------------
 // Utilities
@@ -399,12 +399,29 @@ function setLang(lang) {
 // ---------------------------
 
 function initPdfJs() {
-  // Use vendored worker (no CDN dependency).
-  // Ensure workerSrc is set before any getDocument() call.
-  pdfjsLib.GlobalWorkerOptions.workerSrc = new URL("./vendor/pdfjs/pdf.worker.min.js", import.meta.url).toString();
+  // No-op placeholder (kept for backward references).
+  // Real initialization happens in ensurePdfJs().
+}
+
+async function ensurePdfJs() {
+  if (pdfjsLib) return pdfjsLib;
+  try {
+    const mod = await import("./vendor/pdfjs/pdf.min.js");
+    pdfjsLib = mod;
+    // Use vendored worker (no CDN dependency).
+    // Ensure workerSrc is set before any getDocument() call.
+    pdfjsLib.GlobalWorkerOptions.workerSrc = new URL("./vendor/pdfjs/pdf.worker.min.js", import.meta.url).toString();
+    return pdfjsLib;
+  } catch (e) {
+    const msg = String(e && e.message ? e.message : e);
+    throw new Error(
+      `PDF.js failed to load. This will disable PDF rendering, but other UI should work. Error: ${msg}`
+    );
+  }
 }
 
 async function loadPdfFromInput() {
+  await ensurePdfJs();
   const file = $("pdfFile").files && $("pdfFile").files[0];
   if (!file) throw new Error("Please choose a PDF file.");
   state.pdfFile = file;
@@ -438,6 +455,7 @@ function getPageRange() {
 }
 
 async function renderPageToCanvas(pageNum, scale) {
+  await ensurePdfJs();
   if (!state.pdfDoc) throw new Error("PDF not loaded.");
   const page = await state.pdfDoc.getPage(pageNum);
   const viewport = page.getViewport({ scale });
@@ -2111,12 +2129,14 @@ function boot() {
   setLang("zh");
   wireUi();
   resetState();
-  initPdfJs();
+  // PDF.js is loaded on-demand; don't block UI if it fails.
+  ensurePdfJs().then(() => log("PDF.js ready.")).catch((e) => log(String(e && e.message ? e.message : e)));
   applyProviderDefaultsTo("global");
   applyProviderDefaultsTo("planner");
   applyProviderDefaultsTo("transcriber");
   applyProviderDefaultsTo("verifier");
   log("Ready.");
+  window.__APP_READY__ = true;
 }
 
 boot();
