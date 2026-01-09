@@ -231,6 +231,24 @@ function applyI18n() {
     rolePlanner: "rolePlanner",
     roleTranscriber: "roleTranscriber",
     roleVerifier: "roleVerifier",
+    lblPlannerProvider: "lblPlannerProvider",
+    lblPlannerBaseUrl: "lblPlannerBaseUrl",
+    lblPlannerModel: "lblPlannerModel",
+    lblPlannerKey: "lblPlannerKey",
+    lblPlannerTemp: "lblPlannerTemp",
+    lblPlannerMaxTokens: "lblPlannerMaxTokens",
+    lblTranscriberProvider: "lblTranscriberProvider",
+    lblTranscriberBaseUrl: "lblTranscriberBaseUrl",
+    lblTranscriberModel: "lblTranscriberModel",
+    lblTranscriberKey: "lblTranscriberKey",
+    lblTranscriberTemp: "lblTranscriberTemp",
+    lblTranscriberMaxTokens: "lblTranscriberMaxTokens",
+    lblVerifierProvider: "lblVerifierProvider",
+    lblVerifierBaseUrl: "lblVerifierBaseUrl",
+    lblVerifierModel: "lblVerifierModel",
+    lblVerifierKey: "lblVerifierKey",
+    lblVerifierTemp: "lblVerifierTemp",
+    lblVerifierMaxTokens: "lblVerifierMaxTokens",
     lblEnabled: "lblEnabled",
     secRunTitle: "secRunTitle",
     secRunDesc: "secRunDesc",
@@ -2125,19 +2143,32 @@ function wireUi() {
 // ---------------------------
 
 function boot() {
-  setTheme("light");
-  setLang("zh");
-  wireUi();
-  resetState();
-  // PDF.js is loaded on-demand; don't block UI if it fails.
-  ensurePdfJs().then(() => log("PDF.js ready.")).catch((e) => log(String(e && e.message ? e.message : e)));
-  applyProviderDefaultsTo("global");
-  applyProviderDefaultsTo("planner");
-  applyProviderDefaultsTo("transcriber");
-  applyProviderDefaultsTo("verifier");
-  log("Ready.");
-  window.__APP_READY__ = true;
+  try {
+    setTheme("light");
+    setLang("zh");
+    wireUi();
+    resetState();
+    // PDF.js is loaded on-demand; don't block UI if it fails.
+    ensurePdfJs().then(() => log("PDF.js ready.")).catch((e) => log(String(e && e.message ? e.message : e)));
+    applyProviderDefaultsTo("global");
+    applyProviderDefaultsTo("planner");
+    applyProviderDefaultsTo("transcriber");
+    applyProviderDefaultsTo("verifier");
+    log("Ready.");
+    window.__APP_READY__ = true;
+  } catch (e) {
+    console.error(e);
+    const msg = String(e && e.message ? e.message : e);
+    try {
+      const box = document.getElementById("logBox");
+      if (box) box.textContent += `\n[BOOT ERROR] ${msg}\n`;
+    } catch (_) {}
+  }
 }
 
-boot();
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", boot);
+} else {
+  boot();
+}
 
