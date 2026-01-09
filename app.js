@@ -359,10 +359,9 @@ function setLang(lang) {
 
 function initPdfJs() {
   if (!window.pdfjsLib) throw new Error("pdfjsLib missing");
-  // Use CDN worker.
+  // Use vendored worker (no CDN dependency).
   // eslint-disable-next-line no-undef
-  pdfjsLib.GlobalWorkerOptions.workerSrc =
-    "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.worker.min.js";
+  pdfjsLib.GlobalWorkerOptions.workerSrc = "./vendor/pdfjs/pdf.worker.min.mjs";
 }
 
 async function loadPdfFromInput() {
