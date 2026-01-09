@@ -4002,90 +4002,105 @@ function wireUi() {
  *   console.log(JSON.stringify(cfg, null, 2));
  */
 function exportConfig() {
+  // 安全获取元素值的辅助函数
+  const getVal = (id, defaultVal = "") => {
+    const el = $(id);
+    return el?.value?.trim?.() ?? el?.value ?? defaultVal;
+  };
+  const getNum = (id, defaultVal = 0) => {
+    const el = $(id);
+    const val = Number(el?.value);
+    return Number.isFinite(val) ? val : defaultVal;
+  };
+  const getChecked = (id, defaultVal = false) => {
+    const el = $(id);
+    return el?.checked ?? defaultVal;
+  };
+
   const config = {
     _version: 1,
     _exportedAt: new Date().toISOString(),
     
     // 全局 LLM 配置
     global: {
-      provider: $("globalProvider").value,
-      baseUrl: $("globalBaseUrl").value.trim(),
-      model: $("globalModel").value.trim(),
-      apiKey: $("globalKey").value,
-      temperature: Number($("globalTemp").value),
-      topP: Number($("globalTopP").value),
-      maxTokens: Number($("globalMaxTokens").value),
-      extraHeaders: $("globalExtraHeaders").value.trim(),
+      provider: getVal("globalProvider", "openai"),
+      baseUrl: getVal("globalBaseUrl", ""),
+      model: getVal("globalModel", ""),
+      apiKey: getVal("globalKey", ""),
+      temperature: getNum("globalTemp", 0.2),
+      topP: getNum("globalTopP", 1),
+      maxTokens: getNum("globalMaxTokens", 4096),
+      extraHeaders: getVal("globalExtraHeaders", ""),
     },
     
     // 角色配置
     planner: {
-      useGlobal: $("plannerUseGlobal").checked,
-      provider: $("plannerProvider").value,
-      baseUrl: $("plannerBaseUrl").value.trim(),
-      model: $("plannerModel").value.trim(),
-      apiKey: $("plannerKey").value,
-      temperature: Number($("plannerTemp").value),
-      maxTokens: Number($("plannerMaxTokens").value),
+      useGlobal: getChecked("plannerUseGlobal", true),
+      provider: getVal("plannerProvider", "openai"),
+      baseUrl: getVal("plannerBaseUrl", ""),
+      model: getVal("plannerModel", ""),
+      apiKey: getVal("plannerKey", ""),
+      temperature: getNum("plannerTemp", 0.2),
+      maxTokens: getNum("plannerMaxTokens", 4096),
     },
     transcriber: {
-      useGlobal: $("transcriberUseGlobal").checked,
-      provider: $("transcriberProvider").value,
-      baseUrl: $("transcriberBaseUrl").value.trim(),
-      model: $("transcriberModel").value.trim(),
-      apiKey: $("transcriberKey").value,
-      temperature: Number($("transcriberTemp").value),
-      maxTokens: Number($("transcriberMaxTokens").value),
+      useGlobal: getChecked("transcriberUseGlobal", true),
+      provider: getVal("transcriberProvider", "openai"),
+      baseUrl: getVal("transcriberBaseUrl", ""),
+      model: getVal("transcriberModel", ""),
+      apiKey: getVal("transcriberKey", ""),
+      temperature: getNum("transcriberTemp", 0.2),
+      maxTokens: getNum("transcriberMaxTokens", 4096),
     },
     verifier: {
-      useGlobal: $("verifierUseGlobal").checked,
-      enabled: $("verifierEnabled").checked,
-      provider: $("verifierProvider").value,
-      baseUrl: $("verifierBaseUrl").value.trim(),
-      model: $("verifierModel").value.trim(),
-      apiKey: $("verifierKey").value,
-      temperature: Number($("verifierTemp").value),
-      maxTokens: Number($("verifierMaxTokens").value),
+      useGlobal: getChecked("verifierUseGlobal", true),
+      enabled: getChecked("verifierEnabled", true),
+      provider: getVal("verifierProvider", "openai"),
+      baseUrl: getVal("verifierBaseUrl", ""),
+      model: getVal("verifierModel", ""),
+      apiKey: getVal("verifierKey", ""),
+      temperature: getNum("verifierTemp", 0.2),
+      maxTokens: getNum("verifierMaxTokens", 4096),
     },
     
     // 运行设置
     run: {
-      concurrency: Number($("concurrency").value),
-      maxRetries: Number($("maxRetries").value),
-      organizeConcurrency: Number($("organizeConcurrency").value),
-      organizerWindow: Number($("organizerWindow").value),
-      organizerOverlap: Number($("organizerOverlap").value),
+      concurrency: getNum("concurrency", 2),
+      maxRetries: getNum("maxRetries", 3),
+      organizeConcurrency: getNum("organizeConcurrency", 2),
+      organizerWindow: getNum("organizerWindow", 7),
+      organizerOverlap: getNum("organizerOverlap", 1),
     },
     
     // 渲染和模板
     render: {
-      scale: Number($("renderScale")?.value || 2),
-      template: $("latexTemplate")?.value || "ctexart",
+      scale: getNum("renderScale", 2),
+      template: getVal("latexTemplate", "ctexart"),
     },
     
     // 图片检测设置
     imageDetection: {
-      useOcrDetection: $("useOcrDetection")?.checked ?? true,
-      useLlmValidation: $("useLlmValidation")?.checked ?? true,
-      ocrLanguage: $("ocrLanguage")?.value ?? "chi_sim+eng",
-      maxCropRefine: Number($("maxCropRefine")?.value || 0),
+      useOcrDetection: getChecked("useOcrDetection", true),
+      useLlmValidation: getChecked("useLlmValidation", true),
+      ocrLanguage: getVal("ocrLanguage", "chi_sim+eng"),
+      maxCropRefine: getNum("maxCropRefine", 3),
     },
     
     // LaTeX 修复设置
     latexRepair: {
-      repairTheorems: $("repairTheoremsEnabled")?.checked ?? false,
-      repairWithLlm: $("repairUseLlm")?.checked ?? false,
+      repairTheorems: getChecked("repairTheoremsEnabled", false),
+      repairWithLlm: getChecked("repairUseLlm", false),
     },
     
     // 工作记录设置
     workRecord: {
-      importClearFirst: $("importClearFirst")?.checked ?? true,
+      importClearFirst: getChecked("importClearFirst", true),
     },
     
     // UI 设置
     ui: {
-      theme: currentTheme,
-      lang: currentLang,
+      theme: typeof currentTheme !== "undefined" ? currentTheme : "light",
+      lang: typeof currentLang !== "undefined" ? currentLang : "zh",
     },
   };
   
@@ -4093,7 +4108,7 @@ function exportConfig() {
 }
 
 /**
- * 导入配置
+ * 导入配置（尽力导入模式：缺失字段跳过，不影响其他字段）
  * 用法（浏览器控制台）：
  *   importConfig({ global: { provider: "openai", ... }, ... });
  */
@@ -4103,110 +4118,113 @@ function importConfig(config) {
     return false;
   }
   
-  try {
-    // 全局配置
-    if (config.global) {
-      const g = config.global;
-      if (g.provider) $("globalProvider").value = g.provider;
-      if (g.baseUrl !== undefined) $("globalBaseUrl").value = g.baseUrl;
-      if (g.model) $("globalModel").value = g.model;
-      if (g.apiKey !== undefined) $("globalKey").value = g.apiKey;
-      if (g.temperature !== undefined) $("globalTemp").value = g.temperature;
-      if (g.topP !== undefined) $("globalTopP").value = g.topP;
-      if (g.maxTokens !== undefined) $("globalMaxTokens").value = g.maxTokens;
-      if (g.extraHeaders !== undefined) $("globalExtraHeaders").value = g.extraHeaders;
-    }
-    
-    // 角色配置
-    const roles = ["planner", "transcriber", "verifier"];
-    for (const role of roles) {
-      if (config[role]) {
-        const r = config[role];
-        if (r.useGlobal !== undefined) $(role + "UseGlobal").checked = r.useGlobal;
-        if (r.provider) $(role + "Provider").value = r.provider;
-        if (r.baseUrl !== undefined) $(role + "BaseUrl").value = r.baseUrl;
-        if (r.model) $(role + "Model").value = r.model;
-        if (r.apiKey !== undefined) $(role + "Key").value = r.apiKey;
-        if (r.temperature !== undefined) $(role + "Temp").value = r.temperature;
-        if (r.maxTokens !== undefined) $(role + "MaxTokens").value = r.maxTokens;
-        if (role === "verifier" && r.enabled !== undefined) {
-          $("verifierEnabled").checked = r.enabled;
-        }
-      }
-    }
-    
-    // 运行设置
-    if (config.run) {
-      const r = config.run;
-      if (r.concurrency !== undefined) $("concurrency").value = r.concurrency;
-      if (r.maxRetries !== undefined) $("maxRetries").value = r.maxRetries;
-      if (r.organizeConcurrency !== undefined) $("organizeConcurrency").value = r.organizeConcurrency;
-      if (r.organizerWindow !== undefined) $("organizerWindow").value = r.organizerWindow;
-      if (r.organizerOverlap !== undefined) $("organizerOverlap").value = r.organizerOverlap;
-    }
-    
-    // 渲染和模板
-    if (config.render) {
-      if (config.render.scale !== undefined && $("renderScale")) {
-        $("renderScale").value = config.render.scale;
-      }
-      // 兼容旧配置的 dpi 字段
-      if (config.render.dpi !== undefined && $("renderScale")) {
-        $("renderScale").value = config.render.dpi;
-      }
-      if (config.render.template && $("latexTemplate")) {
-        $("latexTemplate").value = config.render.template;
-      }
-    }
-    
-    // 图片检测设置
-    if (config.imageDetection) {
-      const img = config.imageDetection;
-      if (img.useOcrDetection !== undefined && $("useOcrDetection")) {
-        $("useOcrDetection").checked = img.useOcrDetection;
-      }
-      if (img.useLlmValidation !== undefined && $("useLlmValidation")) {
-        $("useLlmValidation").checked = img.useLlmValidation;
-      }
-      if (img.ocrLanguage && $("ocrLanguage")) {
-        $("ocrLanguage").value = img.ocrLanguage;
-      }
-      if (img.maxCropRefine !== undefined && $("maxCropRefine")) {
-        $("maxCropRefine").value = img.maxCropRefine;
-      }
-    }
-    
-    // LaTeX 修复设置
-    if (config.latexRepair) {
-      const lx = config.latexRepair;
-      if (lx.repairTheorems !== undefined && $("repairTheoremsEnabled")) {
-        $("repairTheoremsEnabled").checked = lx.repairTheorems;
-      }
-      if (lx.repairWithLlm !== undefined && $("repairUseLlm")) {
-        $("repairUseLlm").checked = lx.repairWithLlm;
-      }
-    }
-    
-    // 工作记录设置
-    if (config.workRecord) {
-      if (config.workRecord.importClearFirst !== undefined && $("importClearFirst")) {
-        $("importClearFirst").checked = config.workRecord.importClearFirst;
-      }
-    }
-    
-    // UI 设置
-    if (config.ui) {
-      if (config.ui.theme) setTheme(config.ui.theme);
-      if (config.ui.lang) setLang(config.ui.lang);
-    }
-    
-    console.log("✅ 配置导入成功");
-    log("配置已导入");
-    return true;
-  } catch (e) {
-    console.error("importConfig 失败:", e);
-    return false;
+  // 安全设置元素值的辅助函数（元素不存在或设置失败时静默跳过）
+  const setVal = (id, val) => {
+    try {
+      const el = $(id);
+      if (el && val !== undefined) el.value = val;
+    } catch (e) { /* 静默跳过 */ }
+  };
+  const setChecked = (id, val) => {
+    try {
+      const el = $(id);
+      if (el && val !== undefined) el.checked = val;
+    } catch (e) { /* 静默跳过 */ }
+  };
+  
+  let importedCount = 0;
+  let skippedCount = 0;
+  
+  // 全局配置
+  if (config.global) {
+    const g = config.global;
+    setVal("globalProvider", g.provider); importedCount++;
+    setVal("globalBaseUrl", g.baseUrl); importedCount++;
+    setVal("globalModel", g.model); importedCount++;
+    setVal("globalKey", g.apiKey); importedCount++;
+    setVal("globalTemp", g.temperature); importedCount++;
+    setVal("globalTopP", g.topP); importedCount++;
+    setVal("globalMaxTokens", g.maxTokens); importedCount++;
+    setVal("globalExtraHeaders", g.extraHeaders); importedCount++;
   }
+  
+  // 角色配置
+  const roles = ["planner", "transcriber", "verifier"];
+  for (const role of roles) {
+    if (config[role]) {
+      const r = config[role];
+      setChecked(role + "UseGlobal", r.useGlobal);
+      setVal(role + "Provider", r.provider);
+      setVal(role + "BaseUrl", r.baseUrl);
+      setVal(role + "Model", r.model);
+      setVal(role + "Key", r.apiKey);
+      setVal(role + "Temp", r.temperature);
+      setVal(role + "MaxTokens", r.maxTokens);
+      if (role === "verifier") {
+        setChecked("verifierEnabled", r.enabled);
+      }
+      importedCount++;
+    }
+  }
+  
+  // 运行设置
+  if (config.run) {
+    const r = config.run;
+    setVal("concurrency", r.concurrency);
+    setVal("maxRetries", r.maxRetries);
+    setVal("organizeConcurrency", r.organizeConcurrency);
+    setVal("organizerWindow", r.organizerWindow);
+    setVal("organizerOverlap", r.organizerOverlap);
+    importedCount++;
+  }
+  
+  // 渲染和模板
+  if (config.render) {
+    setVal("renderScale", config.render.scale);
+    // 兼容旧配置的 dpi 字段
+    if (config.render.dpi !== undefined) {
+      setVal("renderScale", config.render.dpi);
+    }
+    setVal("latexTemplate", config.render.template);
+    importedCount++;
+  }
+  
+  // 图片检测设置
+  if (config.imageDetection) {
+    const img = config.imageDetection;
+    setChecked("useOcrDetection", img.useOcrDetection);
+    setChecked("useLlmValidation", img.useLlmValidation);
+    setVal("ocrLanguage", img.ocrLanguage);
+    setVal("maxCropRefine", img.maxCropRefine);
+    importedCount++;
+  }
+  
+  // LaTeX 修复设置
+  if (config.latexRepair) {
+    const lx = config.latexRepair;
+    setChecked("repairTheoremsEnabled", lx.repairTheorems);
+    setChecked("repairUseLlm", lx.repairWithLlm);
+    importedCount++;
+  }
+  
+  // 工作记录设置
+  if (config.workRecord) {
+    setChecked("importClearFirst", config.workRecord.importClearFirst);
+    importedCount++;
+  }
+  
+  // UI 设置
+  if (config.ui) {
+    try {
+      if (config.ui.theme && typeof setTheme === "function") setTheme(config.ui.theme);
+      if (config.ui.lang && typeof setLang === "function") setLang(config.ui.lang);
+      importedCount++;
+    } catch (e) { /* 静默跳过 */ }
+  }
+  
+  console.log(`✅ 配置导入完成（已导入 ${importedCount} 个配置组）`);
+  log("配置已导入");
+  return true;
 }
 
 /**
