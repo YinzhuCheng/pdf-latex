@@ -406,11 +406,11 @@ function initPdfJs() {
 async function ensurePdfJs() {
   if (pdfjsLib) return pdfjsLib;
   try {
-    const mod = await import("./vendor/pdfjs/pdf.min.js");
+    const mod = await import("/vendor/pdfjs/pdf.min.js");
     pdfjsLib = mod;
     // Use vendored worker (no CDN dependency).
     // Ensure workerSrc is set before any getDocument() call.
-    pdfjsLib.GlobalWorkerOptions.workerSrc = new URL("./vendor/pdfjs/pdf.worker.min.js", import.meta.url).toString();
+    pdfjsLib.GlobalWorkerOptions.workerSrc = "/vendor/pdfjs/pdf.worker.min.js";
     return pdfjsLib;
   } catch (e) {
     const msg = String(e && e.message ? e.message : e);
