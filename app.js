@@ -489,6 +489,538 @@ async function previewOnePage() {
 }
 
 // ---------------------------
+// OCR (Tesseract.js)
+// ---------------------------
+
+let tesseractWorker = null;
+let tesseractReady = false;
+
+async function initTesseract() {
+  if (tesseractReady && tesseractWorker) return tesseractWorker;
+  
+  if (typeof Tesseract === "undefined") {
+    throw new Error("Tesseract.js 未加载。请检查网络连接。");
+  }
+
+  const statusEl = document.getElementById("ocrStatus");
+  if (statusEl) setPill(statusEl, "warn", "初始化中...");
+  
+  const lang = document.getElementById("ocrLanguage")?.value || "chi_sim+eng";
+  log(`初始化 Tesseract.js，语言: ${lang}`);
+  
+  try {
+    tesseractWorker = await Tesseract.createWorker(lang, 1, {
+      logger: (m) => {
+        if (m.status === "recognizing text") {
+          const pct = Math.round((m.progress || 0) * 100);
+          if (statusEl) setPill(statusEl, "warn", `识别中 ${pct}%`);
+        }
+      },
+    });
+    tesseractReady = true;
+    if (statusEl) setPill(statusEl, "ok", "就绪");
+    log("Tesseract.js 初始化完成");
+    return tesseractWorker;
+  } catch (e) {
+    if (statusEl) setPill(statusEl, "bad", "失败");
+    throw new Error(`Tesseract 初始化失败: ${e.message || e}`);
+  }
+}
+
+async function ocrExtractTextBlocks(canvas) {
+  const worker = await initTesseract();
+  const statusEl = document.getElementById("ocrStatus");
+  if (statusEl) setPill(statusEl, "warn", "识别中...");
+  
+  try {
+    const result = await worker.recognize(canvas);
+    if (statusEl) setPill(statusEl, "ok", "完成");
+    
+    // 提取所有文字块及其边界框
+    const blocks = [];
+    if (result.data && result.data.words) {
+      for (const word of result.data.words) {
+        blocks.push({
+          text: word.text,
+          confidence: word.confidence,
+          bbox: {
+            x: word.bbox.x0,
+            y: word.bbox.y0,
+            w: word.bbox.x1 - word.bbox.x0,
+            h: word.bbox.y1 - word.bbox.y0,
+          },
+        });
+      }
+    }
+    
+    // 也提取行级别的信息（更适合识别图标题）
+    const lines = [];
+    if (result.data && result.data.lines) {
+      for (const line of result.data.lines) {
+        lines.push({
+          text: line.text,
+          confidence: line.confidence,
+          bbox: {
+            x: line.bbox.x0,
+            y: line.bbox.y0,
+            w: line.bbox.x1 - line.bbox.x0,
+            h: line.bbox.y1 - line.bbox.y0,
+          },
+        });
+      }
+    }
+    
+    return { blocks, lines, fullText: result.data.text };
+  } catch (e) {
+    if (statusEl) setPill(statusEl, "bad", "失败");
+    throw e;
+  }
+}
+
+// ---------------------------
+// Figure Caption Detection
+// ---------------------------
+
+// 图标题正则模式（中英文）
+const FIGURE_CAPTION_PATTERNS = [
+  // 中文模式
+  /^图\s*(\d+(?:[.\-]\d+)*)/i,
+  /^圖\s*(\d+(?:[.\-]\d+)*)/i,
+  // 英文模式
+  /^figure\s*(\d+(?:[.\-]\d+)*)/i,
+  /^fig\.\s*(\d+(?:[.\-]\d+)*)/i,
+  /^fig\s+(\d+(?:[.\-]\d+)*)/i,
+];
+
+function isFigureCaption(text) {
+  const trimmed = (text || "").trim();
+  for (const pattern of FIGURE_CAPTION_PATTERNS) {
+    if (pattern.test(trimmed)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function extractFigureCaptionsFromOcr(ocrResult) {
+  const captions = [];
+  
+  // 从行级别结果中查找图标题
+  for (const line of ocrResult.lines || []) {
+    if (isFigureCaption(line.text)) {
+      captions.push({
+        text: line.text.trim(),
+        bbox: line.bbox,
+        confidence: line.confidence,
+      });
+    }
+  }
+  
+  return captions;
+}
+
+// LLM 分析图标题的提示词
+function buildCaptionAnalysisPrompt(ocrLines) {
+  const linesJson = ocrLines.map((l, i) => ({
+    index: i,
+    text: l.text,
+    y: l.bbox.y,
+    x: l.bbox.x,
+  }));
+  
+  return `你是图片标题识别专家。以下是 OCR 提取的文本行列表（含坐标）。
+请找出所有的图片标题（如"图 1.1 xxx"、"Figure 2.3 xxx"等）。
+
+OCR 文本行：
+${JSON.stringify(linesJson, null, 2)}
+
+请输出严格 JSON（无多余文字）：
+{
+  "captions": [
+    {
+      "index": 行索引,
+      "figure_id": "fig_1_1",
+      "caption_text": "完整标题文本",
+      "confidence": "high|medium|low"
+    }
+  ]
+}
+
+注意：
+- 只识别图片标题，不要识别表格标题（表 X.X / Table X）
+- 标题通常以"图"、"圖"、"Figure"、"Fig."开头
+- 如果没有找到图标题，返回空数组`;
+}
+
+async function analyzeCaptionsWithLlm(ocrLines, llmCfg, maxRetries) {
+  if (!ocrLines || ocrLines.length === 0) {
+    return [];
+  }
+  
+  const system = "You are a strict JSON-only figure caption detector.";
+  const userText = buildCaptionAnalysisPrompt(ocrLines);
+  
+  try {
+    const resp = stripCodeFences(
+      await llmCallWithRetry(llmCfg, { system, userText, imageDataUrl: null, signal: null }, { maxRetries })
+    );
+    const parsed = safeJsonParse(resp);
+    if (!parsed.ok) {
+      log("LLM 图标题分析返回非 JSON，使用正则回退");
+      return [];
+    }
+    
+    const captions = [];
+    for (const cap of parsed.value.captions || []) {
+      const lineIdx = cap.index;
+      if (lineIdx >= 0 && lineIdx < ocrLines.length) {
+        captions.push({
+          text: cap.caption_text || ocrLines[lineIdx].text,
+          bbox: ocrLines[lineIdx].bbox,
+          figureId: cap.figure_id,
+          confidence: cap.confidence,
+        });
+      }
+    }
+    return captions;
+  } catch (e) {
+    log(`LLM 图标题分析失败: ${e.message || e}`);
+    return [];
+  }
+}
+
+// ---------------------------
+// Image Processing: Edge Detection
+// ---------------------------
+
+function canvasToGrayscale(canvas) {
+  const ctx = canvas.getContext("2d");
+  const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const data = imageData.data;
+  const gray = new Uint8Array(canvas.width * canvas.height);
+  
+  for (let i = 0; i < data.length; i += 4) {
+    // 灰度 = 0.299*R + 0.587*G + 0.114*B
+    gray[i / 4] = Math.round(0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]);
+  }
+  
+  return { gray, width: canvas.width, height: canvas.height };
+}
+
+function sobelEdgeDetection(grayData, threshold) {
+  const { gray, width, height } = grayData;
+  const edges = new Uint8Array(width * height);
+  
+  // Sobel 算子
+  const sobelX = [-1, 0, 1, -2, 0, 2, -1, 0, 1];
+  const sobelY = [-1, -2, -1, 0, 0, 0, 1, 2, 1];
+  
+  for (let y = 1; y < height - 1; y++) {
+    for (let x = 1; x < width - 1; x++) {
+      let gx = 0, gy = 0;
+      
+      for (let ky = -1; ky <= 1; ky++) {
+        for (let kx = -1; kx <= 1; kx++) {
+          const idx = (y + ky) * width + (x + kx);
+          const kidx = (ky + 1) * 3 + (kx + 1);
+          gx += gray[idx] * sobelX[kidx];
+          gy += gray[idx] * sobelY[kidx];
+        }
+      }
+      
+      const magnitude = Math.sqrt(gx * gx + gy * gy);
+      edges[y * width + x] = magnitude > threshold ? 255 : 0;
+    }
+  }
+  
+  return edges;
+}
+
+function findRectanglesAboveCaption(edges, width, height, captionBbox, minWidth, minHeight) {
+  // 在标题上方搜索矩形区域
+  const searchTop = 0;
+  const searchBottom = captionBbox.y - 5; // 标题上方留一点间距
+  const searchLeft = Math.max(0, captionBbox.x - 50);
+  const searchRight = Math.min(width, captionBbox.x + captionBbox.w + 50);
+  
+  if (searchBottom <= searchTop) return null;
+  
+  // 从标题位置向上扫描，寻找水平边缘线
+  const horizontalLines = [];
+  
+  for (let y = searchBottom; y >= searchTop; y--) {
+    let lineStart = -1;
+    let lineLength = 0;
+    
+    for (let x = searchLeft; x < searchRight; x++) {
+      if (edges[y * width + x] > 0) {
+        if (lineStart < 0) lineStart = x;
+        lineLength++;
+      } else {
+        if (lineLength > minWidth * 0.5) {
+          horizontalLines.push({ y, x1: lineStart, x2: lineStart + lineLength });
+        }
+        lineStart = -1;
+        lineLength = 0;
+      }
+    }
+    if (lineLength > minWidth * 0.5) {
+      horizontalLines.push({ y, x1: lineStart, x2: lineStart + lineLength });
+    }
+  }
+  
+  // 尝试找到构成矩形的边
+  // 简化策略：找到最接近标题的底边，然后向上找顶边
+  if (horizontalLines.length < 2) return null;
+  
+  // 按 y 坐标排序（从下到上）
+  horizontalLines.sort((a, b) => b.y - a.y);
+  
+  // 底边：最接近标题的水平线
+  const bottomLine = horizontalLines[0];
+  
+  // 顶边：在底边上方，长度相近的水平线
+  let topLine = null;
+  for (let i = 1; i < horizontalLines.length; i++) {
+    const line = horizontalLines[i];
+    const lengthDiff = Math.abs((line.x2 - line.x1) - (bottomLine.x2 - bottomLine.x1));
+    const heightDiff = bottomLine.y - line.y;
+    
+    if (heightDiff >= minHeight && lengthDiff < minWidth * 0.3) {
+      topLine = line;
+      break;
+    }
+  }
+  
+  if (!topLine) return null;
+  
+  // 构建矩形
+  const rect = {
+    x: Math.min(bottomLine.x1, topLine.x1),
+    y: topLine.y,
+    w: Math.max(bottomLine.x2, topLine.x2) - Math.min(bottomLine.x1, topLine.x1),
+    h: bottomLine.y - topLine.y,
+  };
+  
+  // 验证矩形合理性
+  if (rect.w < minWidth || rect.h < minHeight) return null;
+  if (rect.w / rect.h > 5 || rect.h / rect.w > 5) return null; // 宽高比过极端
+  
+  return rect;
+}
+
+// ---------------------------
+// Image Processing: Whitespace Detection
+// ---------------------------
+
+function detectWhitespaceBoundary(grayData, captionBbox, minHeight) {
+  const { gray, width, height } = grayData;
+  
+  // 从标题位置向上扫描
+  const searchTop = 0;
+  const searchBottom = captionBbox.y - 5;
+  const searchLeft = Math.max(0, captionBbox.x - 30);
+  const searchRight = Math.min(width, captionBbox.x + captionBbox.w + 30);
+  
+  if (searchBottom <= searchTop) return null;
+  
+  // 计算每行的像素密度（非白色像素占比）
+  const rowDensity = [];
+  const whiteThreshold = 240; // 接近白色的阈值
+  
+  for (let y = searchBottom; y >= searchTop; y--) {
+    let nonWhiteCount = 0;
+    for (let x = searchLeft; x < searchRight; x++) {
+      if (gray[y * width + x] < whiteThreshold) {
+        nonWhiteCount++;
+      }
+    }
+    rowDensity.push({
+      y,
+      density: nonWhiteCount / (searchRight - searchLeft),
+    });
+  }
+  
+  // 寻找密度变化的边界
+  // 策略：从标题向上，找到第一个"低密度区"后的"高密度区"结束点
+  
+  const lowDensityThreshold = 0.02; // 空白行阈值
+  const highDensityThreshold = 0.1; // 内容行阈值
+  
+  let inFigure = false;
+  let figureTop = -1;
+  let figureBottom = searchBottom;
+  let consecutiveLowDensity = 0;
+  
+  for (let i = 0; i < rowDensity.length; i++) {
+    const { y, density } = rowDensity[i];
+    
+    if (!inFigure) {
+      // 还没进入图片区域
+      if (density > highDensityThreshold) {
+        inFigure = true;
+        figureBottom = y;
+      }
+    } else {
+      // 已在图片区域内
+      if (density < lowDensityThreshold) {
+        consecutiveLowDensity++;
+        if (consecutiveLowDensity > 5) {
+          // 连续多行空白，认为图片结束
+          figureTop = y + consecutiveLowDensity;
+          break;
+        }
+      } else {
+        consecutiveLowDensity = 0;
+        figureTop = y;
+      }
+    }
+  }
+  
+  if (figureTop < 0 || figureBottom - figureTop < minHeight) {
+    return null;
+  }
+  
+  // 左右边界：扫描列密度
+  let figureLeft = searchLeft;
+  let figureRight = searchRight;
+  
+  // 左边界
+  for (let x = searchLeft; x < searchRight; x++) {
+    let colDensity = 0;
+    for (let y = figureTop; y <= figureBottom; y++) {
+      if (gray[y * width + x] < whiteThreshold) colDensity++;
+    }
+    if (colDensity / (figureBottom - figureTop) > lowDensityThreshold) {
+      figureLeft = x;
+      break;
+    }
+  }
+  
+  // 右边界
+  for (let x = searchRight - 1; x >= searchLeft; x--) {
+    let colDensity = 0;
+    for (let y = figureTop; y <= figureBottom; y++) {
+      if (gray[y * width + x] < whiteThreshold) colDensity++;
+    }
+    if (colDensity / (figureBottom - figureTop) > lowDensityThreshold) {
+      figureRight = x;
+      break;
+    }
+  }
+  
+  return {
+    x: figureLeft,
+    y: figureTop,
+    w: figureRight - figureLeft,
+    h: figureBottom - figureTop,
+  };
+}
+
+// ---------------------------
+// Combined Figure Detection
+// ---------------------------
+
+async function detectFigureBboxes(canvas, pageNum) {
+  const useOcr = document.getElementById("useOcrDetection")?.checked ?? true;
+  const useEdge = document.getElementById("useEdgeDetection")?.checked ?? true;
+  const useWhitespace = document.getElementById("useWhitespaceDetection")?.checked ?? true;
+  const edgeThreshold = Number(document.getElementById("edgeThreshold")?.value || 50);
+  
+  const width = canvas.width;
+  const height = canvas.height;
+  const minFigWidth = width * 0.1;
+  const minFigHeight = height * 0.05;
+  
+  const detectedFigures = [];
+  
+  if (!useOcr) {
+    log(`页 ${pageNum}: OCR 辅助定位已禁用，跳过图片检测`);
+    return detectedFigures;
+  }
+  
+  // 1. OCR 提取文字
+  log(`页 ${pageNum}: 运行 OCR...`);
+  let ocrResult;
+  try {
+    ocrResult = await ocrExtractTextBlocks(canvas);
+    log(`页 ${pageNum}: OCR 完成，识别 ${ocrResult.lines.length} 行文字`);
+  } catch (e) {
+    log(`页 ${pageNum}: OCR 失败: ${e.message || e}`);
+    return detectedFigures;
+  }
+  
+  // 2. 用正则直接识别图标题
+  let captions = extractFigureCaptionsFromOcr(ocrResult);
+  log(`页 ${pageNum}: 正则识别到 ${captions.length} 个图标题`);
+  
+  // 3. 如果正则没找到，尝试用 LLM 分析
+  if (captions.length === 0 && ocrResult.lines.length > 0) {
+    log(`页 ${pageNum}: 尝试 LLM 分析图标题...`);
+    const llmCfg = getRoleConfig("transcriber");
+    const { maxRetries } = getRunSettings();
+    captions = await analyzeCaptionsWithLlm(ocrResult.lines, llmCfg, maxRetries);
+    log(`页 ${pageNum}: LLM 识别到 ${captions.length} 个图标题`);
+  }
+  
+  if (captions.length === 0) {
+    log(`页 ${pageNum}: 未检测到图标题`);
+    return detectedFigures;
+  }
+  
+  // 4. 图像处理：检测图片边界
+  const grayData = canvasToGrayscale(canvas);
+  let edges = null;
+  if (useEdge) {
+    edges = sobelEdgeDetection(grayData, edgeThreshold);
+  }
+  
+  // 5. 对每个图标题，检测其上方的图片区域
+  for (let i = 0; i < captions.length; i++) {
+    const caption = captions[i];
+    const figureId = caption.figureId || `p${pageNum}_fig${i + 1}`;
+    
+    log(`页 ${pageNum}: 处理图标题 "${caption.text.slice(0, 30)}..." (y=${caption.bbox.y})`);
+    
+    let bbox = null;
+    
+    // 策略 A：黑框检测
+    if (useEdge && edges) {
+      bbox = findRectanglesAboveCaption(edges, width, height, caption.bbox, minFigWidth, minFigHeight);
+      if (bbox) {
+        log(`页 ${pageNum}: 黑框检测成功 - ${figureId}`);
+      }
+    }
+    
+    // 策略 B：空白边界检测（回退）
+    if (!bbox && useWhitespace) {
+      bbox = detectWhitespaceBoundary(grayData, caption.bbox, minFigHeight);
+      if (bbox) {
+        log(`页 ${pageNum}: 空白边界检测成功 - ${figureId}`);
+      }
+    }
+    
+    if (bbox) {
+      // 验证 bbox 合理性
+      bbox = normalizeBbox(bbox, width, height);
+      if (bbox) {
+        detectedFigures.push({
+          id: figureId,
+          bbox,
+          caption: caption.text,
+          captionBbox: caption.bbox,
+          method: edges ? "edge" : "whitespace",
+        });
+      }
+    } else {
+      log(`页 ${pageNum}: 无法检测图片边界 - ${figureId}，将使用 LLM 估计`);
+    }
+  }
+  
+  return detectedFigures;
+}
+
+// ---------------------------
 // LLM protocol adapters (OpenAI / Gemini / Claude)
 // ---------------------------
 
@@ -1100,6 +1632,22 @@ async function transcribeAndCrop() {
     out.height = canvas.height;
     out.getContext("2d").drawImage(canvas, 0, 0);
 
+    // === 新增：OCR + 图像处理检测图片 ===
+    const useOcrDetection = document.getElementById("useOcrDetection")?.checked ?? true;
+    let ocrDetectedFigures = [];
+    
+    if (useOcrDetection) {
+      try {
+        setStage(`Transcribe: page ${pageNum} (OCR 检测)`);
+        ocrDetectedFigures = await detectFigureBboxes(canvas, pageNum);
+        log(`页 ${pageNum}: OCR 检测到 ${ocrDetectedFigures.length} 个图片`);
+      } catch (e) {
+        log(`页 ${pageNum}: OCR 检测失败，将使用 LLM 检测: ${e.message || e}`);
+      }
+    }
+
+    // === LLM 转写（LaTeX + 结构） ===
+    setStage(`Transcribe: page ${pageNum} (LLM)`);
     const dataUrl = canvas.toDataURL("image/png");
     const system = "You are a careful math textbook transcriber. Output JSON only.";
     const userText = buildTranscriptionPrompt({ pageNum, width, height });
@@ -1112,7 +1660,7 @@ async function transcribeAndCrop() {
     );
     respText = stripCodeFences(respText);
 
-    // If it isn't JSON, do one stricter retry (counts as one attempt through retry wrapper above, so do it manually here)
+    // If it isn't JSON, do one stricter retry
     const parsed = safeJsonParse(respText);
     if (!parsed.ok) {
       log(`Page ${pageNum}: output not JSON. Retrying once with stricter JSON-only instruction.`);
@@ -1131,35 +1679,66 @@ async function transcribeAndCrop() {
     const latex = typeof obj.latex === "string" ? obj.latex : "";
     const annotations =
       obj.annotations && typeof obj.annotations === "object" ? obj.annotations : { headings: [], notes: [] };
-    const figures = Array.isArray(obj.figures) ? obj.figures : [];
+    const llmFigures = Array.isArray(obj.figures) ? obj.figures : [];
 
-    // Crop figures (LLM decides which real figures to keep; if none -> no image saved)
-    for (let fi = 0; fi < figures.length; fi++) {
-      const fig = figures[fi] || {};
-      const desired = String(fig.id || `p${pageNum}_fig${fi + 1}`);
-      const id = uniqueImageId(desired);
-      const bbox0 = normalizeBbox(fig.bbox, width, height);
-      if (!bbox0) {
-        log(`Page ${pageNum}: skip figure ${desired} (invalid bbox).`);
+    // === 合并图片检测结果：OCR 优先，LLM 补充 ===
+    const ocrFigureIds = new Set(ocrDetectedFigures.map(f => f.id));
+    const finalFigures = [...ocrDetectedFigures];
+    
+    // 添加 LLM 检测到但 OCR 没检测到的图片
+    for (const fig of llmFigures) {
+      const figId = fig.id || `p${pageNum}_fig${finalFigures.length + 1}`;
+      if (!ocrFigureIds.has(figId)) {
+        // LLM 检测到的图，OCR 没检测到
+        const bbox0 = normalizeBbox(fig.bbox, width, height);
+        if (bbox0) {
+          finalFigures.push({
+            id: figId,
+            bbox: bbox0,
+            caption: fig.evidence || "",
+            method: "llm",
+          });
+        }
+      }
+    }
+
+    // === 裁剪图片 ===
+    const processedFigures = [];
+    for (let fi = 0; fi < finalFigures.length; fi++) {
+      const fig = finalFigures[fi];
+      const id = uniqueImageId(fig.id);
+      let bbox = fig.bbox;
+      
+      // 如果是 LLM 检测的，可能需要自校正
+      if (fig.method === "llm" && maxCropRefine > 0) {
+        log(`页 ${pageNum}: 图 ${id} 使用 LLM bbox，尝试自校正`);
+        bbox = await refineFigureBboxWithLlm({
+          pageNum,
+          width,
+          height,
+          figureId: id,
+          initialBbox: bbox,
+          pageCanvas: canvas,
+          llmCfg: transcriberCfg,
+          maxRetries,
+          maxRefine: maxCropRefine,
+          signal,
+        });
+      }
+      
+      // 最终验证 bbox
+      bbox = normalizeBbox(bbox, width, height);
+      if (!bbox) {
+        log(`Page ${pageNum}: skip figure ${id} (invalid bbox after processing).`);
         continue;
       }
-      const bbox = await refineFigureBboxWithLlm({
-        pageNum,
-        width,
-        height,
-        figureId: id,
-        initialBbox: bbox0,
-        pageCanvas: canvas,
-        llmCfg: transcriberCfg,
-        maxRetries,
-        maxRefine: maxCropRefine,
-        signal,
-      });
+      
       const blob = await cropPngFromCanvas(canvas, bbox);
       if (!blob) {
         log(`Page ${pageNum}: crop failed for ${id}.`);
         continue;
       }
+      
       const filename = `${id}.png`;
       const referencedIn = [pageNum];
       state.images.set(id, {
@@ -1169,10 +1748,21 @@ async function transcribeAndCrop() {
         bbox,
         blob,
         referencedIn,
-        evidence: String(fig.evidence || ""),
+        evidence: fig.caption || "",
+        detectionMethod: fig.method || "ocr",
       });
+      
+      processedFigures.push({
+        id,
+        bbox,
+        evidence: fig.caption || "",
+        method: fig.method || "ocr",
+      });
+      
+      log(`页 ${pageNum}: 裁剪图片 ${id} (${fig.method || "ocr"}) - ${bbox.w}x${bbox.h}`);
     }
 
+    // 更新 LaTeX 中的图片引用
     const includeIds = extractIncludeGraphicsIds(latex);
     for (const id of includeIds) {
       const img = state.images.get(id);
@@ -1187,10 +1777,13 @@ async function transcribeAndCrop() {
       height,
       latex,
       annotations,
-      figures,
+      figures: processedFigures,
       raw: obj,
     });
-    log(`Transcribed page ${pageNum}: latex_chars=${latex.length}, figures=${figures.length}`);
+    
+    const ocrCount = processedFigures.filter(f => f.method !== "llm").length;
+    const llmCount = processedFigures.filter(f => f.method === "llm").length;
+    log(`Transcribed page ${pageNum}: latex=${latex.length}字符, 图片=${processedFigures.length}(OCR:${ocrCount}, LLM:${llmCount})`);
     updateOutputsPanels();
   }
 
