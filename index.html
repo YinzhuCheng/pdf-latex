@@ -338,13 +338,22 @@
 
         <div class="grid grid--2">
           <div class="field">
-            <label class="field__label" id="lblWorkRecord">工作记录（断点续作）</label>
+            <label class="field__label" id="lblWorkRecord">工作记录（断点续作 / 完整恢复）</label>
             <div class="inline">
               <input class="field__input" id="workRecordFile" type="file" accept=".zip,application/zip" />
               <button class="btn btn--ghost" id="importWorkRecordBtn" type="button">导入</button>
               <button class="btn btn--ghost" id="exportWorkRecordBtn" type="button">导出</button>
             </div>
-            <div class="field__hint" id="hintWorkRecord">导出/导入包含已完成页 JSON 与剪裁 PNG，用于继续未完成页。</div>
+            <div class="inline" style="margin-top:6px">
+              <label class="toggle">
+                <input id="importClearFirst" type="checkbox" checked />
+                <span class="toggle__label">导入前清空现有数据</span>
+              </label>
+            </div>
+            <div class="field__hint" id="hintWorkRecord">
+              导出/导入包含：每页 JSON、剪裁图片、窗口计划、章节树、main.tex。<br>
+              勾选"清空"可完整恢复工作状态；取消勾选则合并数据（断点续作）。
+            </div>
           </div>
           <div class="field">
             <label class="field__label" id="lblOrgConcurrency">滑动窗口并发数</label>

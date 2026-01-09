@@ -2226,7 +2226,7 @@ async function exportWorkRecordZip() {
   const imgs = Array.from(state.images.values()).sort((a, b) => (a.page - b.page) || a.id.localeCompare(b.id));
 
   const record = {
-    version: 1,
+    version: 2, // 升级版本号，包含更多字段
     created_at: nowIso(),
     pdf: {
       name: state.pdfFile ? state.pdfFile.name : null,
@@ -2243,19 +2243,45 @@ async function exportWorkRecordZip() {
       referenced_in: img.referencedIn,
       evidence: img.evidence || "",
     })),
+    // 记录各阶段完成状态
+    stages: {
+      transcribe_done: pagesArr.length > 0,
+      window_assemble_done: state.windowPlans && state.windowPlans.length > 0,
+      organize_done: !!state.mainTex,
+      section_tree_done: !!state.sectionTree,
+    },
   };
   zip.file("work_record.json", JSON.stringify(record, null, 2));
 
+  // 保存每页 JSON
   const pagesFolder = zip.folder("pages");
   for (const p of pagesArr) {
     pagesFolder.file(`page_${pad3(p.page)}.json`, JSON.stringify(p.raw || p, null, 2));
   }
 
+  // 保存图片
   for (let i = 0; i < imgs.length; i++) {
-    setPageProgress(`${i + 1} / ${imgs.length}`, imgs.length ? i / imgs.length : 1);
+    setPageProgress(`图片 ${i + 1} / ${imgs.length}`, imgs.length ? i / imgs.length : 1);
     zip.file(imgs[i].filename, imgs[i].blob);
   }
 
+  // 保存后期阶段产物
+  if (state.windowPlans && state.windowPlans.length > 0) {
+    zip.file("window_plans.json", JSON.stringify(state.windowPlans, null, 2));
+    log("导出包含 window_plans.json");
+  }
+
+  if (state.sectionTree) {
+    zip.file("section_tree.json", JSON.stringify(state.sectionTree, null, 2));
+    log("导出包含 section_tree.json");
+  }
+
+  if (state.mainTex) {
+    zip.file("main.tex", state.mainTex);
+    log("导出包含 main.tex");
+  }
+
+  setStage("Export: generating…");
   const blob = await zip.generateAsync({ type: "blob" }, (meta) => {
     if (meta && typeof meta.percent === "number") {
       setPageProgress(`${meta.percent.toFixed(0)}%`, meta.percent / 100);
@@ -2269,7 +2295,7 @@ async function exportWorkRecordZip() {
   a.click();
   setStage("Export: work record done");
   setPageProgress("100%", 1);
-  log("Work record ZIP downloaded.");
+  log(`工作记录已导出: ${pagesArr.length} 页, ${imgs.length} 图片`);
 }
 
 async function importWorkRecordZip() {
@@ -2278,21 +2304,49 @@ async function importWorkRecordZip() {
   if (!file) throw new Error("Please choose a work record ZIP.");
   if (!state.pdfBytes) throw new Error("Load the PDF first, then import the work record.");
 
+  // 检查是否需要先清空现有数据
+  const clearFirst = document.getElementById("importClearFirst")?.checked ?? true;
+
   setStage("Import: work record");
   setPageProgress("—", 0);
   const buf = await file.arrayBuffer();
   const zip = await window.JSZip.loadAsync(buf);
-  const recordText = await zip.file("work_record.json").async("string");
+  
+  const recordFile = zip.file("work_record.json");
+  if (!recordFile) throw new Error("ZIP 中没有找到 work_record.json");
+  
+  const recordText = await recordFile.async("string");
   const parsed = safeJsonParse(recordText);
   if (!parsed.ok) throw new Error("Invalid work_record.json in ZIP.");
   const record = parsed.value;
+  
+  // 检查 PDF 指纹匹配
   if (!record.pdf || record.pdf.sha256 !== state.pdfSha256) {
-    throw new Error("Work record PDF fingerprint does not match the currently loaded PDF.");
+    const msg = `工作记录的 PDF 指纹不匹配！\n` +
+      `记录中的 PDF: ${record.pdf?.name || "unknown"} (SHA256: ${record.pdf?.sha256?.slice(0, 16)}...)\n` +
+      `当前加载的 PDF: ${state.pdfFile?.name || "unknown"} (SHA256: ${state.pdfSha256?.slice(0, 16)}...)`;
+    throw new Error(msg);
   }
 
+  // 如果选择清空，则先清除现有数据（保留 PDF 相关信息）
+  if (clearFirst) {
+    log("清空现有数据后导入...");
+    state.pageResults.clear();
+    state.images.clear();
+    state.sectionTree = null;
+    state.mainTex = "";
+    state.windowPlans = [];
+  }
+
+  let pagesLoaded = 0;
+  let pagesSkipped = 0;
+  let imagesLoaded = 0;
+
   // Load page JSONs
+  setStage("Import: loading pages");
   const pageFiles = Object.keys(zip.files).filter((p) => p.startsWith("pages/") && p.endsWith(".json"));
   for (let i = 0; i < pageFiles.length; i++) {
+    setPageProgress(`页面 ${i + 1} / ${pageFiles.length}`, i / pageFiles.length);
     const path = pageFiles[i];
     const txt = await zip.file(path).async("string");
     const pj = safeJsonParse(txt);
@@ -2300,46 +2354,91 @@ async function importWorkRecordZip() {
     const obj = pj.value;
     const pageNum = Number(obj.page || obj.raw?.page);
     if (!Number.isFinite(pageNum)) continue;
-    if (state.pageResults.has(pageNum)) continue;
-    const latex = typeof obj.latex === "string" ? obj.latex : (obj.raw && typeof obj.raw.latex === "string" ? obj.raw.latex : "");
+    
+    // 允许覆盖已存在的页面数据（如果工作记录中的数据更完整）
+    const existing = state.pageResults.get(pageNum);
+    const newLatex = typeof obj.latex === "string" ? obj.latex : (obj.raw && typeof obj.raw.latex === "string" ? obj.raw.latex : "");
+    
+    // 如果已存在且新数据不比旧数据更完整，则跳过
+    if (existing && existing.latex && !newLatex) {
+      pagesSkipped++;
+      continue;
+    }
+    
     const annotations = obj.annotations || (obj.raw ? obj.raw.annotations : null) || { headings: [], notes: [] };
     const figures = obj.figures || (obj.raw ? obj.raw.figures : null) || [];
     state.pageResults.set(pageNum, {
       page: pageNum,
-      width: obj.width || 0,
-      height: obj.height || 0,
-      latex,
+      width: obj.width || (obj.raw ? obj.raw.width : 0) || 0,
+      height: obj.height || (obj.raw ? obj.raw.height : 0) || 0,
+      latex: newLatex,
       annotations,
       figures,
       raw: obj.raw || obj,
     });
+    pagesLoaded++;
   }
 
   // Load PNGs (top-level)
+  setStage("Import: loading images");
   const pngFiles = Object.keys(zip.files).filter((p) => p.endsWith(".png") && !p.includes("/"));
   for (let i = 0; i < pngFiles.length; i++) {
+    setPageProgress(`图片 ${i + 1} / ${pngFiles.length}`, i / pngFiles.length);
     const name = pngFiles[i];
     const blob = await zip.file(name).async("blob");
     const id = name.replace(/\.png$/i, "");
-    if (!state.images.has(id)) {
-      const meta = (record.images || []).find((x) => x && x.id === id);
-      state.images.set(id, {
-        id,
-        filename: name,
-        page: meta ? meta.page : 0,
-        bbox: meta ? meta.bbox : null,
-        blob,
-        referencedIn: meta ? (meta.referenced_in || []) : [],
-        evidence: meta ? (meta.evidence || "") : "",
-      });
+    // 覆盖已存在的图片
+    const meta = (record.images || []).find((x) => x && x.id === id);
+    state.images.set(id, {
+      id,
+      filename: name,
+      page: meta ? meta.page : 0,
+      bbox: meta ? meta.bbox : null,
+      blob,
+      referencedIn: meta ? (meta.referenced_in || []) : [],
+      evidence: meta ? (meta.evidence || "") : "",
+    });
+    imagesLoaded++;
+  }
+
+  // 加载后期阶段产物
+  setStage("Import: loading artifacts");
+
+  // 加载 window_plans.json
+  const windowPlansFile = zip.file("window_plans.json");
+  if (windowPlansFile) {
+    const wpText = await windowPlansFile.async("string");
+    const wpParsed = safeJsonParse(wpText);
+    if (wpParsed.ok && Array.isArray(wpParsed.value)) {
+      state.windowPlans = wpParsed.value;
+      log(`导入 window_plans: ${state.windowPlans.length} 个窗口`);
     }
+  }
+
+  // 加载 section_tree.json
+  const sectionTreeFile = zip.file("section_tree.json");
+  if (sectionTreeFile) {
+    const stText = await sectionTreeFile.async("string");
+    const stParsed = safeJsonParse(stText);
+    if (stParsed.ok && stParsed.value) {
+      state.sectionTree = stParsed.value;
+      log("导入 section_tree.json");
+    }
+  }
+
+  // 加载 main.tex
+  const mainTexFile = zip.file("main.tex");
+  if (mainTexFile) {
+    state.mainTex = await mainTexFile.async("string");
+    log(`导入 main.tex: ${state.mainTex.length} 字符`);
   }
 
   state.run.lastRange = record.range || state.run.lastRange;
   updateOutputsPanels();
   setStage("Import: done");
   setPageProgress("100%", 1);
-  log(`Imported work record: pages=${state.pageResults.size}, images=${state.images.size}`);
+  log(`工作记录导入完成: 加载 ${pagesLoaded} 页 (跳过 ${pagesSkipped}), ${imagesLoaded} 图片`);
+  log(`当前状态: pages=${state.pageResults.size}, images=${state.images.size}, mainTex=${state.mainTex ? "有" : "无"}`);
 }
 
 // ---------------------------
