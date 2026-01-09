@@ -4059,8 +4059,8 @@ function exportConfig() {
     
     // 渲染和模板
     render: {
-      dpi: Number($("renderDpi").value),
-      template: $("docTemplate").value,
+      scale: Number($("renderScale")?.value || 2),
+      template: $("latexTemplate")?.value || "ctexart",
     },
     
     // 图片检测设置
@@ -4073,8 +4073,8 @@ function exportConfig() {
     
     // LaTeX 修复设置
     latexRepair: {
-      repairTheorems: $("repairTheorems")?.checked ?? true,
-      repairWithLlm: $("repairWithLlm")?.checked ?? false,
+      repairTheorems: $("repairTheoremsEnabled")?.checked ?? false,
+      repairWithLlm: $("repairUseLlm")?.checked ?? false,
     },
     
     // 工作记录设置
@@ -4147,8 +4147,16 @@ function importConfig(config) {
     
     // 渲染和模板
     if (config.render) {
-      if (config.render.dpi !== undefined) $("renderDpi").value = config.render.dpi;
-      if (config.render.template) $("docTemplate").value = config.render.template;
+      if (config.render.scale !== undefined && $("renderScale")) {
+        $("renderScale").value = config.render.scale;
+      }
+      // 兼容旧配置的 dpi 字段
+      if (config.render.dpi !== undefined && $("renderScale")) {
+        $("renderScale").value = config.render.dpi;
+      }
+      if (config.render.template && $("latexTemplate")) {
+        $("latexTemplate").value = config.render.template;
+      }
     }
     
     // 图片检测设置
@@ -4171,11 +4179,11 @@ function importConfig(config) {
     // LaTeX 修复设置
     if (config.latexRepair) {
       const lx = config.latexRepair;
-      if (lx.repairTheorems !== undefined && $("repairTheorems")) {
-        $("repairTheorems").checked = lx.repairTheorems;
+      if (lx.repairTheorems !== undefined && $("repairTheoremsEnabled")) {
+        $("repairTheoremsEnabled").checked = lx.repairTheorems;
       }
-      if (lx.repairWithLlm !== undefined && $("repairWithLlm")) {
-        $("repairWithLlm").checked = lx.repairWithLlm;
+      if (lx.repairWithLlm !== undefined && $("repairUseLlm")) {
+        $("repairUseLlm").checked = lx.repairWithLlm;
       }
     }
     
