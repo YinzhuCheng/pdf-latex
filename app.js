@@ -868,86 +868,259 @@ function canvasToGrayscale(canvas) {
 }
 
 /**
- * 找到图标题上方、与图片有间距的"上一行文字"
- * 算法改进版：
- * 1. 从标题向上找，当间距 > 2倍行高时，认为中间是图片
- * 2. 如果上方没有文字或只有少量文字在页面很上方，说明图片在页面顶部
- * 3. 检查是否是段落续行（避免误判段内引用）
- * 
- * @param {Array} ocrLines - OCR 识别的所有文字行（应该是已过滤的段落文字）
- * @param {Object} captionBbox - 图标题的 bbox
- * @param {number} pageHeight - 页面高度
- * @returns {Object} { bbox, isPageTop, gap, figureTop }
+ * 判断一行是否是"段落末行"（短行，不是满行）
+ * 段落末行通常比正常行短，且上一行是满行
  */
-function findPreviousTextLine(ocrLines, captionBbox, pageHeight) {
-  // 筛选在标题上方的文字行（行底部 y+h 在标题顶部 y 之上）
-  const linesAbove = ocrLines.filter(line => {
-    const lineBottom = line.bbox.y + line.bbox.h;
-    return lineBottom < captionBbox.y;
-  });
+function isParagraphEndingLine(line, allLines, pageWidth) {
+  const lineWidth = line.bbox.w;
+  const widthRatio = lineWidth / pageWidth;
   
-  // 估算页边距（通常页边距在 5-10% 页高）
-  const topMargin = pageHeight * 0.05;
-  
-  if (linesAbove.length === 0) {
-    // 没有上方文字，图片在页面顶部
-    // 图片顶部 = 页边距
-    return { 
-      bbox: { x: 0, y: 0, w: captionBbox.w, h: 0 }, 
-      isPageTop: true, 
-      gap: captionBbox.y,
-      figureTop: topMargin  // 从页边距开始
-    };
+  // 如果是满行（> 75% 页宽），不是段落末行
+  if (widthRatio > 0.75) {
+    return false;
   }
   
-  // 按 y 坐标降序排列（从下往上，即从最接近标题的开始）
+  // 如果是短行（< 75% 页宽），检查上一行
+  // 找到紧邻的上一行
+  const lineY = line.bbox.y;
+  const lineH = line.bbox.h;
+  
+  let prevLine = null;
+  let minGap = Infinity;
+  for (const other of allLines) {
+    const otherBottom = other.bbox.y + other.bbox.h;
+    if (otherBottom < lineY && otherBottom > lineY - lineH * 3) {
+      const gap = lineY - otherBottom;
+      if (gap < minGap) {
+        minGap = gap;
+        prevLine = other;
+      }
+    }
+  }
+  
+  if (prevLine) {
+    const prevWidthRatio = prevLine.bbox.w / pageWidth;
+    // 上一行是满行，当前行是短行 = 段落末行
+    if (prevWidthRatio > 0.75) {
+      return true;
+    }
+  }
+  
+  return false;
+}
+
+/**
+ * 生成图片上边界的候选列表（迭代法用）
+ * 从标题往上，找到所有可能的"图片上边界"候选位置
+ * 
+ * @param {Array} ocrLines - OCR 识别的段落文字行
+ * @param {Object} captionBbox - 图标题的 bbox
+ * @param {number} pageWidth - 页面宽度
+ * @param {number} pageHeight - 页面高度
+ * @returns {Array} 候选上边界列表，按优先级排序（最可能的在前）
+ */
+function generateTopBoundaryCandidates(ocrLines, captionBbox, pageWidth, pageHeight) {
+  const candidates = [];
+  const padding = 8;
+  const topMargin = pageHeight * 0.05;
+  
+  // 筛选在标题上方的文字行
+  const linesAbove = ocrLines.filter(line => {
+    const lineBottom = line.bbox.y + line.bbox.h;
+    return lineBottom < captionBbox.y - 20; // 留点余量
+  });
+  
+  if (linesAbove.length === 0) {
+    // 没有上方文字，只有页面顶部作为候选
+    candidates.push({
+      figureTop: topMargin,
+      reason: "page_top",
+      confidence: "medium",
+    });
+    return candidates;
+  }
+  
+  // 按 y 坐标降序排列（从下往上）
   linesAbove.sort((a, b) => (b.bbox.y + b.bbox.h) - (a.bbox.y + a.bbox.h));
   
-  // 计算平均行高（用于判断"显著间距"）
+  // 计算平均行高
   let totalHeight = 0;
   for (const line of linesAbove) {
     totalHeight += line.bbox.h;
   }
   const avgLineHeight = totalHeight / linesAbove.length;
   
-  // 从最接近标题的行开始，找到有"显著间距"的行
-  // 显著间距 = 间距 > 2倍平均行高（说明中间有图片）
+  // 遍历每个上方文字行，生成候选
   for (let i = 0; i < linesAbove.length; i++) {
     const line = linesAbove[i];
     const lineBottom = line.bbox.y + line.bbox.h;
     const gap = captionBbox.y - lineBottom;
     
-    // 判断条件：间距大于 2 倍行高，或大于 50 像素（处理行高计算不准的情况）
+    // 跳过离标题太近的行（间距 < 1.5 倍行高）
+    if (gap < avgLineHeight * 1.5) {
+      continue;
+    }
+    
+    // 检查是否是段落末行
+    const isEndingLine = isParagraphEndingLine(line, linesAbove, pageWidth);
+    
+    // 计算候选上边界
+    const figureTop = lineBottom + Math.min(avgLineHeight * 0.3, 10);
+    
+    // 判断条件：间距大，或者当前行是满行（明确的段落边界）
     const significantGap = Math.max(avgLineHeight * 2, 50);
+    const lineWidthRatio = line.bbox.w / pageWidth;
+    
+    let confidence = "low";
+    let reason = "text_boundary";
     
     if (gap > significantGap) {
-      // 这行文字和标题之间有足够的空间，应该是图片所在区域
-      // 图片顶部 = 该行文字底部 + 小间距
-      const figureTop = lineBottom + Math.min(avgLineHeight * 0.3, 10);
-      return { bbox: line.bbox, isPageTop: false, gap, figureTop };
+      confidence = "high";
+      reason = "large_gap";
+    } else if (lineWidthRatio > 0.8 && !isEndingLine) {
+      // 满行且不是段落末行（下一行开始是新内容）
+      confidence = "medium";
+      reason = "full_line_boundary";
+    } else if (isEndingLine) {
+      // 段落末行，图片可能在更上方
+      confidence = "low";
+      reason = "paragraph_ending";
     }
+    
+    candidates.push({
+      figureTop,
+      lineBottom,
+      line,
+      reason,
+      confidence,
+      gap,
+      isEndingLine,
+    });
   }
   
-  // 特殊情况：如果最上方的文字行距离页面顶部有很大空白
-  // 说明图片可能在页面最上方（文字行是在图片下方的其他内容）
-  const topMostLine = linesAbove[linesAbove.length - 1];
-  const gapFromPageTop = topMostLine.bbox.y - topMargin;
+  // 添加页面顶部作为最后的候选
+  candidates.push({
+    figureTop: topMargin,
+    reason: "page_top",
+    confidence: "low",
+  });
   
-  if (gapFromPageTop > captionBbox.y - (topMostLine.bbox.y + topMostLine.bbox.h)) {
-    // 页面顶部空白 > 标题上方空白，图片可能在页面顶部
-    // 这种情况下返回页面顶部
-    return { 
-      bbox: { x: 0, y: topMargin, w: captionBbox.w, h: 0 }, 
-      isPageTop: true, 
-      gap: captionBbox.y - topMargin,
-      figureTop: topMargin
+  // 按优先级排序：high > medium > low，同优先级按 figureTop 降序（离标题近的优先）
+  const priorityOrder = { high: 0, medium: 1, low: 2 };
+  candidates.sort((a, b) => {
+    const pDiff = priorityOrder[a.confidence] - priorityOrder[b.confidence];
+    if (pDiff !== 0) return pDiff;
+    return b.figureTop - a.figureTop; // figureTop 大的（离标题近）优先
+  });
+  
+  return candidates;
+}
+
+/**
+ * LLM 验证裁剪的图片是否完整
+ * @param {string} croppedImageDataUrl - 裁剪后的图片 data URL
+ * @param {string} captionText - 图标题文本
+ * @param {Object} llmCfg - LLM 配置
+ * @param {number} maxRetries - 最大重试次数
+ * @returns {Object} { isComplete: boolean, issue: string|null }
+ */
+async function validateCroppedFigureWithLlm(croppedImageDataUrl, captionText, llmCfg, maxRetries) {
+  const system = "You are a strict JSON-only image validation assistant.";
+  const userText = `请判断这张裁剪的图片是否完整。
+
+图片标题：${captionText}
+
+请检查：
+1. 图片是否完整显示了标题所描述的内容？
+2. 图片顶部是否被截断（缺少部分内容）？
+3. 图片顶部是否包含了不相关的文字（如段落文字）？
+4. 图片是否有意义（不是空白或乱码）？
+
+请输出严格 JSON：
+{
+  "is_complete": true或false,
+  "issue": "问题描述，如果完整则为null",
+  "suggestion": "top_ok" 或 "need_expand_up" 或 "need_shrink_down"
+}
+
+- "top_ok": 顶部边界正确
+- "need_expand_up": 图片被截断，需要向上扩展
+- "need_shrink_down": 顶部包含多余内容，需要向下收缩`;
+
+  try {
+    const resp = stripCodeFences(
+      await llmCallWithRetry(llmCfg, { system, userText, imageDataUrl: croppedImageDataUrl, signal: null }, { maxRetries })
+    );
+    const parsed = safeJsonParse(resp);
+    if (!parsed.ok) {
+      return { isComplete: false, issue: "LLM 返回非 JSON", suggestion: "top_ok" };
+    }
+    return {
+      isComplete: parsed.value.is_complete === true,
+      issue: parsed.value.issue || null,
+      suggestion: parsed.value.suggestion || "top_ok",
     };
+  } catch (e) {
+    log(`LLM 图片验证失败: ${e.message || e}`);
+    return { isComplete: false, issue: "LLM 调用失败", suggestion: "top_ok" };
+  }
+}
+
+/**
+ * LLM 从多个候选中选择最佳裁剪
+ * @param {Array} candidateImages - 候选图片列表 [{ dataUrl, figureTop, reason }]
+ * @param {string} captionText - 图标题文本
+ * @param {Object} llmCfg - LLM 配置
+ * @param {number} maxRetries - 最大重试次数
+ * @returns {number} 最佳候选的索引
+ */
+async function selectBestCropWithLlm(candidateImages, captionText, llmCfg, maxRetries) {
+  if (candidateImages.length === 0) return -1;
+  if (candidateImages.length === 1) return 0;
+  
+  // 构建提示词，描述每个候选
+  const system = "You are a strict JSON-only image selection assistant.";
+  let userText = `图片标题：${captionText}
+
+我有 ${candidateImages.length} 个候选裁剪结果。请选择最完整、最正确的那个。
+
+候选列表：
+`;
+  
+  for (let i = 0; i < candidateImages.length; i++) {
+    userText += `- 候选 ${i}: ${candidateImages[i].reason}\n`;
   }
   
-  // 默认情况：返回最上方的文字行，图片在其下方
-  // 这种情况可能是：图片很小，或者排版紧凑
-  const figureTop = topMostLine.bbox.y + topMostLine.bbox.h + Math.min(avgLineHeight * 0.3, 10);
-  return { bbox: topMostLine.bbox, isPageTop: false, gap: 0, figureTop };
+  userText += `
+请根据图片内容判断哪个裁剪最好（图片完整、没有截断、没有多余文字）。
+
+输出严格 JSON：
+{
+  "best_index": 最佳候选的索引（0到${candidateImages.length - 1}）,
+  "reason": "选择理由"
+}`;
+
+  // 由于无法一次发送多张图片，我们发送第一张让 LLM 作为参考
+  // 实际上这个函数可能需要改进，但先用简单方案
+  try {
+    const resp = stripCodeFences(
+      await llmCallWithRetry(llmCfg, { 
+        system, 
+        userText, 
+        imageDataUrl: candidateImages[0].dataUrl, 
+        signal: null 
+      }, { maxRetries })
+    );
+    const parsed = safeJsonParse(resp);
+    if (!parsed.ok || typeof parsed.value.best_index !== "number") {
+      return 0; // 默认选第一个
+    }
+    const idx = parsed.value.best_index;
+    return (idx >= 0 && idx < candidateImages.length) ? idx : 0;
+  } catch (e) {
+    log(`LLM 选择最佳裁剪失败: ${e.message || e}`);
+    return 0;
+  }
 }
 
 /**
@@ -1031,40 +1204,18 @@ function findHorizontalBoundsByDensity(grayData, top, bottom, hintLeft, hintRigh
 }
 
 /**
- * 主要的图片边界检测函数（文字夹逼法 改进版）
- * @param {Array} ocrLines - OCR 识别的所有文字行（已过滤段落文字）
- * @param {Object} captionBbox - 图标题的 bbox {x, y, w, h}
- * @param {Object} grayData - 灰度图像数据
- * @param {number} pageWidth - 页面宽度
- * @param {number} pageHeight - 页面高度
- * @returns {Object|null} 图片的 bbox {x, y, w, h}
+ * 根据候选上边界构建 bbox
  */
-function detectFigureBboxByTextSandwich(ocrLines, captionBbox, grayData, pageWidth, pageHeight) {
-  const padding = 8; // 边界内缩像素
+function buildBboxFromCandidate(candidate, captionBbox, grayData, pageWidth, pageHeight) {
+  const padding = 8;
+  const figureTop = candidate.figureTop;
+  const figureBottom = captionBbox.y - padding;
   
-  // 第一步：找到上方的文字行
-  const prevTextResult = findPreviousTextLine(ocrLines, captionBbox, pageHeight);
-  
-  if (!prevTextResult) {
-    return null;
-  }
-  
-  // 第二步：确定垂直边界
-  // 使用改进后的 figureTop（已考虑页边距和行间距）
-  let figureTop = prevTextResult.figureTop ?? padding;
-  let figureBottom;
-  
-  // 图片底部 = 标题顶部 - padding
-  figureBottom = captionBbox.y - padding;
-  
-  // 验证垂直范围有效
   const figureHeight = figureBottom - figureTop;
   if (figureHeight < 30) {
-    // 高度太小，可能识别错误
     return null;
   }
   
-  // 第三步：确定水平边界
   const hintLeft = captionBbox.x;
   const hintRight = captionBbox.x + captionBbox.w;
   
@@ -1076,7 +1227,6 @@ function detectFigureBboxByTextSandwich(ocrLines, captionBbox, grayData, pageWid
     hintRight
   );
   
-  // 构建最终 bbox
   const bbox = {
     x: Math.max(0, left - padding),
     y: Math.max(0, figureTop),
@@ -1084,18 +1234,146 @@ function detectFigureBboxByTextSandwich(ocrLines, captionBbox, grayData, pageWid
     h: figureHeight,
   };
   
-  // 验证 bbox 合理性
   if (bbox.w < 30 || bbox.h < 30) {
     return null;
   }
   
-  // 宽高比检查（排除极端情况）
   const aspectRatio = bbox.w / bbox.h;
   if (aspectRatio > 10 || aspectRatio < 0.1) {
     return null;
   }
   
   return bbox;
+}
+
+/**
+ * 从 canvas 裁剪指定区域并返回 data URL
+ */
+function cropCanvasToDataUrl(canvas, bbox) {
+  const cropCanvas = document.createElement("canvas");
+  cropCanvas.width = bbox.w;
+  cropCanvas.height = bbox.h;
+  const ctx = cropCanvas.getContext("2d");
+  ctx.drawImage(canvas, bbox.x, bbox.y, bbox.w, bbox.h, 0, 0, bbox.w, bbox.h);
+  return cropCanvas.toDataURL("image/png");
+}
+
+/**
+ * 迭代式图片边界检测（LLM 验证版）
+ * 
+ * 算法流程：
+ * 1. 生成多个候选上边界
+ * 2. 对每个候选裁剪图片，让 LLM 验证是否完整
+ * 3. 如果 LLM 认为完整，返回该 bbox
+ * 4. 如果所有候选都不完整，让 LLM 从中选择最佳
+ * 
+ * @param {HTMLCanvasElement} canvas - 页面 canvas
+ * @param {Array} ocrLines - OCR 识别的段落文字行
+ * @param {Object} captionBbox - 图标题的 bbox
+ * @param {string} captionText - 图标题文本
+ * @param {Object} grayData - 灰度图像数据
+ * @param {number} pageWidth - 页面宽度
+ * @param {number} pageHeight - 页面高度
+ * @param {Object} llmCfg - LLM 配置
+ * @param {number} maxRetries - 最大重试次数
+ * @returns {Object|null} { bbox, method, validatedByLlm }
+ */
+async function detectFigureBboxIterative(canvas, ocrLines, captionBbox, captionText, grayData, pageWidth, pageHeight, llmCfg, maxRetries) {
+  const padding = 8;
+  
+  // 第一步：生成候选上边界
+  const candidates = generateTopBoundaryCandidates(ocrLines, captionBbox, pageWidth, pageHeight);
+  
+  if (candidates.length === 0) {
+    log("  无法生成候选上边界");
+    return null;
+  }
+  
+  log(`  生成 ${candidates.length} 个候选上边界`);
+  
+  // 第二步：对高置信度候选，直接使用（不调用 LLM 验证）
+  const highConfidenceCandidates = candidates.filter(c => c.confidence === "high");
+  if (highConfidenceCandidates.length > 0) {
+    const best = highConfidenceCandidates[0];
+    const bbox = buildBboxFromCandidate(best, captionBbox, grayData, pageWidth, pageHeight);
+    if (bbox) {
+      log(`  使用高置信度候选 (${best.reason})`);
+      return { bbox, method: "text_sandwich_high_confidence", validatedByLlm: false };
+    }
+  }
+  
+  // 第三步：对其他候选，迭代验证
+  const candidateResults = [];
+  
+  for (let i = 0; i < Math.min(candidates.length, 4); i++) { // 最多验证 4 个
+    const candidate = candidates[i];
+    const bbox = buildBboxFromCandidate(candidate, captionBbox, grayData, pageWidth, pageHeight);
+    
+    if (!bbox) {
+      continue;
+    }
+    
+    // 裁剪图片
+    const croppedDataUrl = cropCanvasToDataUrl(canvas, bbox);
+    
+    candidateResults.push({
+      candidate,
+      bbox,
+      dataUrl: croppedDataUrl,
+      reason: candidate.reason,
+    });
+    
+    // LLM 验证
+    log(`  验证候选 ${i + 1}/${candidates.length} (${candidate.reason})...`);
+    const validation = await validateCroppedFigureWithLlm(croppedDataUrl, captionText, llmCfg, maxRetries);
+    
+    if (validation.isComplete) {
+      log(`  ✓ 候选 ${i + 1} 验证通过`);
+      return { bbox, method: "iterative_validated", validatedByLlm: true };
+    } else {
+      log(`  ✗ 候选 ${i + 1}: ${validation.issue || "不完整"} (${validation.suggestion})`);
+      
+      // 根据建议决定是否继续
+      if (validation.suggestion === "need_shrink_down") {
+        // 需要向下收缩，跳过后续更大的候选
+        continue;
+      }
+      // need_expand_up: 继续尝试下一个候选（上边界更高）
+    }
+  }
+  
+  // 第四步：如果没有通过验证的，选择最佳候选
+  if (candidateResults.length > 0) {
+    log(`  所有候选均未通过验证，选择最可能的...`);
+    
+    // 优先选择 high/medium confidence
+    const sorted = candidateResults.sort((a, b) => {
+      const order = { high: 0, medium: 1, low: 2 };
+      return (order[a.candidate.confidence] || 2) - (order[b.candidate.confidence] || 2);
+    });
+    
+    // 选第一个（最高置信度）
+    const best = sorted[0];
+    log(`  使用候选: ${best.reason}`);
+    return { bbox: best.bbox, method: "iterative_fallback", validatedByLlm: false };
+  }
+  
+  return null;
+}
+
+/**
+ * 简单版图片边界检测（不调用 LLM 验证，用于快速模式）
+ */
+function detectFigureBboxSimple(ocrLines, captionBbox, grayData, pageWidth, pageHeight) {
+  const candidates = generateTopBoundaryCandidates(ocrLines, captionBbox, pageWidth, pageHeight);
+  
+  if (candidates.length === 0) {
+    return null;
+  }
+  
+  // 选择最高置信度的候选
+  const best = candidates[0];
+  return buildBboxFromCandidate(best, captionBbox, grayData, pageWidth, pageHeight);
 }
 
 // 保留旧的边缘检测作为备用（某些情况可能仍有用）
@@ -1128,11 +1406,12 @@ function sobelEdgeDetection(grayData, threshold) {
 }
 
 // ---------------------------
-// Combined Figure Detection
+// Combined Figure Detection (迭代验证版)
 // ---------------------------
 
 async function detectFigureBboxes(canvas, pageNum) {
   const useOcr = document.getElementById("useOcrDetection")?.checked ?? true;
+  const useLlmValidation = document.getElementById("useLlmValidation")?.checked ?? true;
   
   const width = canvas.width;
   const height = canvas.height;
@@ -1163,7 +1442,7 @@ async function detectFigureBboxes(canvas, pageNum) {
   let captions = extractFigureCaptionsFromOcr(ocrResult, width);
   log(`页 ${pageNum}: 正则识别到 ${captions.length} 个图标题`);
   
-  // 4. 如果正则没找到，尝试用 LLM 分析
+  // 4. 如果正则没找到，尝试用 LLM 分析（仅分析标题，不估计坐标）
   if (captions.length === 0 && paragraphLines.length > 0) {
     log(`页 ${pageNum}: 尝试 LLM 分析图标题...`);
     const llmCfg = getRoleConfig("transcriber");
@@ -1180,8 +1459,11 @@ async function detectFigureBboxes(canvas, pageNum) {
   // 5. 准备灰度图像用于水平边界检测
   const grayData = canvasToGrayscale(canvas);
   
-  // 6. 对每个图标题，使用"文字夹逼法"检测图片区域
-  // 按 y 坐标排序（从上到下），方便处理多图情况
+  // 获取 LLM 配置（用于验证）
+  const llmCfg = getRoleConfig("transcriber");
+  const { maxRetries } = getRunSettings();
+  
+  // 6. 对每个图标题，使用迭代验证算法检测图片区域
   captions.sort((a, b) => a.bbox.y - b.bbox.y);
   
   for (let i = 0; i < captions.length; i++) {
@@ -1190,11 +1472,8 @@ async function detectFigureBboxes(canvas, pageNum) {
     
     log(`页 ${pageNum}: 处理图标题 "${caption.text.slice(0, 30)}..." (y=${caption.bbox.y})`);
     
-    // 过滤：
-    // a) 排除所有图标题行
-    // b) 只使用段落文字（已排除图内孤立文字）
+    // 过滤：排除所有图标题行
     const relevantOcrLines = paragraphLines.filter(line => {
-      // 排除所有图标题行
       const isCaption = captions.some(cap => 
         Math.abs(cap.bbox.y - line.bbox.y) < 5 && 
         cap.text.includes(line.text.slice(0, 10))
@@ -1202,31 +1481,44 @@ async function detectFigureBboxes(canvas, pageNum) {
       return !isCaption;
     });
     
-    // 使用"文字夹逼法"检测 bbox（传入过滤后的段落文字）
-    let bbox = detectFigureBboxByTextSandwich(
-      relevantOcrLines,
-      caption.bbox,
-      grayData,
-      width,
-      height
-    );
+    let result = null;
     
-    if (bbox) {
-      log(`页 ${pageNum}: 文字夹逼法检测成功 - ${figureId} (${bbox.x},${bbox.y},${bbox.w},${bbox.h})`);
-      
-      // 验证 bbox 合理性
-      bbox = normalizeBbox(bbox, width, height);
+    if (useLlmValidation) {
+      // 使用迭代验证算法（LLM 验证裁剪结果）
+      result = await detectFigureBboxIterative(
+        canvas,
+        relevantOcrLines,
+        caption.bbox,
+        caption.text,
+        grayData,
+        width,
+        height,
+        llmCfg,
+        maxRetries
+      );
+    } else {
+      // 快速模式：不使用 LLM 验证
+      const bbox = detectFigureBboxSimple(relevantOcrLines, caption.bbox, grayData, width, height);
       if (bbox) {
+        result = { bbox, method: "simple", validatedByLlm: false };
+      }
+    }
+    
+    if (result && result.bbox) {
+      const bbox = normalizeBbox(result.bbox, width, height);
+      if (bbox) {
+        log(`页 ${pageNum}: 检测成功 - ${figureId} (${bbox.x},${bbox.y},${bbox.w},${bbox.h}) [${result.method}]`);
         detectedFigures.push({
           id: figureId,
           bbox,
           caption: caption.text,
           captionBbox: caption.bbox,
-          method: "text_sandwich",
+          method: result.method,
+          validatedByLlm: result.validatedByLlm,
         });
       }
     } else {
-      log(`页 ${pageNum}: 文字夹逼法检测失败 - ${figureId}，将使用 LLM 估计`);
+      log(`页 ${pageNum}: 检测失败 - ${figureId}`);
     }
   }
   
@@ -1728,6 +2020,10 @@ function buildCropRefinePrompt({ pageNum, width, height, figureId, bbox }) {
 `;
 }
 
+/**
+ * @deprecated 此函数已废弃。新算法使用迭代验证（validateCroppedFigureWithLlm），
+ * LLM 只判断图片是否完整，不再估计坐标。保留此函数仅供向后兼容。
+ */
 async function refineFigureBboxWithLlm({
   pageNum,
   width,
@@ -1922,22 +2218,8 @@ async function transcribeAndCrop() {
       const id = uniqueImageId(fig.id);
       let bbox = fig.bbox;
       
-      // 如果是 LLM 检测的，可能需要自校正
-      if (fig.method === "llm" && maxCropRefine > 0) {
-        log(`页 ${pageNum}: 图 ${id} 使用 LLM bbox，尝试自校正`);
-        bbox = await refineFigureBboxWithLlm({
-          pageNum,
-          width,
-          height,
-          figureId: id,
-          initialBbox: bbox,
-          pageCanvas: canvas,
-          llmCfg: transcriberCfg,
-          maxRetries,
-          maxRefine: maxCropRefine,
-          signal,
-        });
-      }
+      // 新算法已经通过迭代验证确保 bbox 正确，无需额外 LLM 校正
+      // （旧的 refineFigureBboxWithLlm 已废弃，不再使用 LLM 估计坐标）
       
       // 最终验证 bbox
       bbox = normalizeBbox(bbox, width, height);
@@ -3784,8 +4066,9 @@ function exportConfig() {
     // 图片检测设置
     imageDetection: {
       useOcrDetection: $("useOcrDetection")?.checked ?? true,
+      useLlmValidation: $("useLlmValidation")?.checked ?? true,
       ocrLanguage: $("ocrLanguage")?.value ?? "chi_sim+eng",
-      maxCropRefine: Number($("maxCropRefine").value),
+      maxCropRefine: Number($("maxCropRefine")?.value || 0),
     },
     
     // LaTeX 修复设置
@@ -3874,10 +4157,13 @@ function importConfig(config) {
       if (img.useOcrDetection !== undefined && $("useOcrDetection")) {
         $("useOcrDetection").checked = img.useOcrDetection;
       }
+      if (img.useLlmValidation !== undefined && $("useLlmValidation")) {
+        $("useLlmValidation").checked = img.useLlmValidation;
+      }
       if (img.ocrLanguage && $("ocrLanguage")) {
         $("ocrLanguage").value = img.ocrLanguage;
       }
-      if (img.maxCropRefine !== undefined) {
+      if (img.maxCropRefine !== undefined && $("maxCropRefine")) {
         $("maxCropRefine").value = img.maxCropRefine;
       }
     }

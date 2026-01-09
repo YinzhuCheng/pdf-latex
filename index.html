@@ -341,8 +341,8 @@
         </div>
 
         <details class="details" style="margin-top:12px">
-          <summary class="details__summary" id="sumFigureDetection">图片检测设置（OCR + 文字夹逼法）</summary>
-          <div class="grid grid--3" style="margin-top:10px">
+          <summary class="details__summary" id="sumFigureDetection">图片检测设置（OCR + 迭代验证）</summary>
+          <div class="grid grid--2" style="margin-top:10px">
             <div class="field">
               <label class="toggle">
                 <input id="useOcrDetection" type="checkbox" checked />
@@ -350,6 +350,15 @@
               </label>
               <div class="field__hint">使用 Tesseract.js 提取文字坐标，精确定位图标题和图片边界</div>
             </div>
+            <div class="field">
+              <label class="toggle">
+                <input id="useLlmValidation" type="checkbox" checked />
+                <span class="toggle__label">启用 LLM 迭代验证</span>
+              </label>
+              <div class="field__hint">让 LLM 验证裁剪结果是否完整，自动调整上边界（更准确但更慢）</div>
+            </div>
+          </div>
+          <div class="grid grid--3" style="margin-top:10px">
             <div class="field">
               <label class="field__label">OCR 语言</label>
               <select class="field__input" id="ocrLanguage">
@@ -363,16 +372,20 @@
               <label class="field__label">OCR 状态</label>
               <div class="pill" id="ocrStatus">未初始化</div>
             </div>
+            <div class="field">
+              <label class="field__label">验证状态</label>
+              <div class="pill" id="validationStatus">就绪</div>
+            </div>
           </div>
           <div class="field" style="margin-top:10px">
             <div class="field__hint" style="line-height:1.6">
-              <strong>文字夹逼法算法说明：</strong><br>
+              <strong>迭代验证算法说明：</strong><br>
               1. OCR 提取页面所有文字及精确坐标<br>
-              2. 识别图标题（"图 X.X" / "Figure X"）<br>
-              3. 找到图标题上方最近的段落文字（有显著间距）<br>
-              4. 图片上边界 = 上方文字底部 + padding<br>
-              5. 图片下边界 = 图标题顶部 - padding<br>
-              6. 左右边界通过像素密度扫描确定
+              2. 识别图标题（"图 X.X" / "Figure X"），区分标题和段落引用<br>
+              3. 生成多个候选上边界（排除段落末行干扰）<br>
+              4. 对每个候选裁剪图片，LLM 验证是否完整<br>
+              5. 如果 LLM 认为不完整，自动尝试下一个候选（上边界上移）<br>
+              6. 直到找到完整裁剪，或从所有候选中选择最佳
             </div>
           </div>
         </details>
