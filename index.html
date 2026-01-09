@@ -330,6 +330,14 @@
             <div class="field__hint" id="hintMaxRetries">网络错误/限流等会自动重试（带退避）。</div>
           </div>
           <div class="field">
+            <label class="field__label" id="lblCropRefine">剪裁自校正（每图最多次数）</label>
+            <input class="field__input" id="maxCropRefine" type="number" min="0" max="5" step="1" value="3" />
+            <div class="field__hint" id="hintCropRefine">对 LLM 给出的 bbox 做多次试探修正，减少截少/截多。</div>
+          </div>
+        </div>
+
+        <div class="grid grid--2">
+          <div class="field">
             <label class="field__label" id="lblWorkRecord">工作记录（断点续作）</label>
             <div class="inline">
               <input class="field__input" id="workRecordFile" type="file" accept=".zip,application/zip" />
@@ -338,13 +346,19 @@
             </div>
             <div class="field__hint" id="hintWorkRecord">导出/导入包含已完成页 JSON 与剪裁 PNG，用于继续未完成页。</div>
           </div>
+          <div class="field">
+            <label class="field__label" id="lblOrgConcurrency">滑动窗口并发数</label>
+            <input class="field__input" id="organizeConcurrency" type="number" min="1" max="8" step="1" value="2" />
+            <div class="field__hint" id="hintOrgConcurrency">窗口级别并发（仅组织阶段）。</div>
+          </div>
         </div>
 
         <div class="actions">
           <button class="btn btn--primary" id="loadPdfBtn" type="button">加载 PDF</button>
           <button class="btn btn--primary" id="transcribeBtn" type="button">1) 按页转写 + 剪裁出图</button>
-          <button class="btn btn--primary" id="organizeBtn" type="button">2) 章节组织 + 生成 main.tex</button>
-          <button class="btn btn--primary" id="exportBtn" type="button">3) 导出 ZIP</button>
+          <button class="btn btn--primary" id="windowAssembleBtn" type="button">2) 滑动窗口初步组装（并发）</button>
+          <button class="btn btn--primary" id="organizeBtn" type="button">3) 整体组装 + 生成 main.tex</button>
+          <button class="btn btn--primary" id="exportBtn" type="button">4) 导出最终 ZIP</button>
           <button class="btn btn--ghost" id="stopBtn" type="button">停止</button>
           <button class="btn btn--ghost" id="continueBtn" type="button">继续</button>
           <button class="btn btn--ghost" id="earlyExportBtn" type="button">早停导出</button>
@@ -381,6 +395,15 @@
         <div class="card__header">
           <div class="card__title" id="secOutTitle">输出</div>
           <div class="card__desc" id="secOutDesc">章节树 / main.tex / 图像资源清单 / 每页 JSON。</div>
+        </div>
+
+        <div class="actions" style="margin-bottom:10px">
+          <button class="btn btn--ghost" id="downloadMainTexBtn" type="button">下载 main.tex</button>
+          <button class="btn btn--ghost" id="downloadSectionTreeBtn" type="button">下载章节树</button>
+          <button class="btn btn--ghost" id="downloadImagesJsonBtn" type="button">下载图像清单</button>
+          <button class="btn btn--ghost" id="downloadPagesZipBtn" type="button">下载 pages.zip</button>
+          <button class="btn btn--ghost" id="downloadImagesZipBtn" type="button">下载 images.zip</button>
+          <button class="btn btn--ghost" id="downloadWindowPlansBtn" type="button">下载窗口组装</button>
         </div>
 
         <div class="tabs">

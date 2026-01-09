@@ -297,6 +297,9 @@ const state = {
     controller: null, // AbortController for current batch
     lastRange: null, // {start,end}
   },
+
+  // stage-2 window assembly artifacts
+  windowPlans: [],
 };
 
 function resetState() {
@@ -314,6 +317,7 @@ function resetState() {
   state.run.earlyExportRequested = false;
   state.run.controller = null;
   state.run.lastRange = null;
+  state.windowPlans = [];
   $("treeBox").textContent = "{}";
   $("texBox").textContent = "";
   $("imagesBox").textContent = "[]";
@@ -347,6 +351,7 @@ function setUiBusy(isBusy) {
   const ids = [
     "loadPdfBtn",
     "transcribeBtn",
+    "windowAssembleBtn",
     "organizeBtn",
     "exportBtn",
     "resetBtn",
@@ -357,6 +362,12 @@ function setUiBusy(isBusy) {
     "verifierConnTestBtn",
     "importWorkRecordBtn",
     "exportWorkRecordBtn",
+    "downloadMainTexBtn",
+    "downloadSectionTreeBtn",
+    "downloadImagesJsonBtn",
+    "downloadPagesZipBtn",
+    "downloadImagesZipBtn",
+    "downloadWindowPlansBtn",
   ];
   for (const id of ids) $(id).disabled = isBusy;
   // Stop/continue are special: stop is enabled while running; continue enabled when not running.
@@ -476,6 +487,15 @@ function getRunSettings() {
   const concurrency = clamp(Number($("concurrency").value || 1), 1, 8);
   const maxRetries = clamp(Number($("maxRetries").value || 0), 0, 10);
   return { concurrency, maxRetries };
+}
+
+function getCropSettings() {
+  const maxCropRefine = clamp(Number($("maxCropRefine").value || 0), 0, 5);
+  return { maxCropRefine };
+}
+
+function getOrganizerConcurrency() {
+  return clamp(Number($("organizeConcurrency").value || 1), 1, 8);
 }
 
 function getGlobalConfig() {
@@ -816,6 +836,33 @@ function buildOrganizerPrompt({ windowPages }) {
   ]
 }
 
+function buildWindowPlanPrompt({ windowPages }) {
+  return `
+你在做“滑动窗口初步组装”（先转写后组织）。输入是一组连续页的转写结果（含 headings 显式证据）。
+请输出严格 JSON（无 Markdown、无多余文字）：
+{
+  "window_pages": [10,11,12],
+  "insertions": [
+    {
+      "page": 10,
+      "level": "chapter|section|subsection|subsubsection",
+      "title": "标题文本（原样）",
+      "evidence": "必须来自输入 headings.evidence",
+      "reason": "一句话说明"
+    }
+  ]
+}
+
+严格规则：
+1) insertions 只能基于输入里 headings 的显式证据，不得新增不存在的标题。
+2) 如证据不足，宁可输出空 insertions。
+3) page 必须是窗口内页码之一。
+
+输入 windowPages（JSON）：
+${JSON.stringify(windowPages, null, 2)}
+`;
+}
+
 严格规则：
 1) 章节结构只能基于输入里 headings 的显式证据，不得新增不存在的标题。
 2) 如果没有足够证据，宁可不分章。
@@ -852,6 +899,87 @@ async function cropPngFromCanvas(canvas, bbox) {
   return await new Promise((resolve) => out.toBlob(resolve, "image/png"));
 }
 
+function downscaleCanvasToDataUrl(canvas, maxSide) {
+  const w = canvas.width;
+  const h = canvas.height;
+  const max = Math.max(w, h);
+  if (max <= maxSide) return canvas.toDataURL("image/png");
+  const scale = maxSide / max;
+  const out = document.createElement("canvas");
+  out.width = Math.max(1, Math.floor(w * scale));
+  out.height = Math.max(1, Math.floor(h * scale));
+  const ctx = out.getContext("2d", { alpha: false });
+  ctx.drawImage(canvas, 0, 0, out.width, out.height);
+  return out.toDataURL("image/png");
+}
+
+function buildCropRefinePrompt({ pageNum, width, height, figureId, bbox }) {
+  return `
+你是“图像剪裁 bbox 校正器”。我会给你一张整页图片，以及当前 figure 的 bbox（像素坐标）。
+请判断该 bbox 是否截少/截多，并给出更合适的 bbox（尽量紧致，但必须包含完整的图；允许包含图内标签如坐标轴刻度/图内标注；尽量避免把正文段落文字包含进来）。
+
+输出必须是严格 JSON（无 Markdown/无多余文字）：
+{
+  "status": "ok|adjust",
+  "bbox": { "x": 0, "y": 0, "w": 0, "h": 0 },
+  "diagnosis": "tight|loose|ok",
+  "note": "一句话说明"
+}
+
+坐标系：
+- 页面像素尺寸：width=${width}, height=${height}
+- bbox 使用左上角为原点的像素坐标：{x,y,w,h}
+- bbox 必须在页面范围内；w/h 必须 > 1
+
+元信息：
+- page=${pageNum}
+- figure_id=${figureId}
+- current_bbox=${JSON.stringify(bbox)}
+`;
+}
+
+async function refineFigureBboxWithLlm({
+  pageNum,
+  width,
+  height,
+  figureId,
+  initialBbox,
+  pageCanvas,
+  llmCfg,
+  maxRetries,
+  maxRefine,
+  signal,
+}) {
+  let bbox = initialBbox;
+  if (maxRefine <= 0) return bbox;
+
+  // Downscale for speed/cost; still aligned to page coordinates via width/height meta + bbox.
+  const imageDataUrl = downscaleCanvasToDataUrl(pageCanvas, 1400);
+  const system = "You are a strict JSON-only crop reviewer.";
+
+  for (let attempt = 1; attempt <= maxRefine; attempt++) {
+    const userText = buildCropRefinePrompt({ pageNum, width, height, figureId, bbox });
+    const resp = stripCodeFences(
+      await llmCallWithRetry(llmCfg, { system, userText, imageDataUrl, signal }, { maxRetries })
+    );
+    const parsed = safeJsonParse(resp);
+    if (!parsed.ok) {
+      log(`Crop refine: invalid JSON (page ${pageNum}, ${figureId}) attempt ${attempt}. Keep current bbox.`);
+      return bbox;
+    }
+    const out = parsed.value || {};
+    const status = String(out.status || "").toLowerCase();
+    const next = normalizeBbox(out.bbox, width, height);
+    if (!next) {
+      log(`Crop refine: invalid bbox (page ${pageNum}, ${figureId}) attempt ${attempt}. Keep current bbox.`);
+      return bbox;
+    }
+    if (status === "ok") return bbox;
+    bbox = next;
+  }
+  return bbox;
+}
+
 function extractIncludeGraphicsIds(latex) {
   const ids = [];
   const re = /\\includegraphics(?:\[[^\]]*\])?\{([^}]+)\}/g;
@@ -873,6 +1001,7 @@ async function transcribeAndCrop() {
 
   const transcriberCfg = getRoleConfig("transcriber");
   const { concurrency, maxRetries } = getRunSettings();
+  const { maxCropRefine } = getCropSettings();
 
   // Breakpoint: skip pages already present
   const pagesToDo = [];
@@ -964,11 +1093,23 @@ async function transcribeAndCrop() {
       const fig = figures[fi] || {};
       const desired = String(fig.id || `p${pageNum}_fig${fi + 1}`);
       const id = uniqueImageId(desired);
-      const bbox = normalizeBbox(fig.bbox, width, height);
-      if (!bbox) {
+      const bbox0 = normalizeBbox(fig.bbox, width, height);
+      if (!bbox0) {
         log(`Page ${pageNum}: skip figure ${desired} (invalid bbox).`);
         continue;
       }
+      const bbox = await refineFigureBboxWithLlm({
+        pageNum,
+        width,
+        height,
+        figureId: id,
+        initialBbox: bbox0,
+        pageCanvas: canvas,
+        llmCfg: transcriberCfg,
+        maxRetries,
+        maxRefine: maxCropRefine,
+        signal,
+      });
       const blob = await cropPngFromCanvas(canvas, bbox);
       if (!blob) {
         log(`Page ${pageNum}: crop failed for ${id}.`);
@@ -1183,6 +1324,118 @@ function chunkPages(pages, windowSize, overlap) {
   return chunks;
 }
 
+async function buildWindowPlansConcurrently() {
+  const pages = Array.from(state.pageResults.keys()).sort((a, b) => a - b);
+  if (!pages.length) throw new Error("No per-page results yet.");
+
+  const plannerCfg = getRoleConfig("planner");
+  const windowSize = clamp(Number($("organizerWindow").value || 7), 3, 15);
+  const overlap = clamp(Number($("organizerOverlap").value || 1), 0, 5);
+  const orgConc = getOrganizerConcurrency();
+
+  const pageChunks = chunkPages(pages, windowSize, overlap);
+  if (!pageChunks.length) return [];
+
+  let nextIdx = 0;
+  const results = new Array(pageChunks.length);
+
+  async function runOne(idx) {
+    const chunk = pageChunks[idx];
+    const windowPages = chunk.map((p) => {
+      const pr = state.pageResults.get(p);
+      return { page: p, latex: pr.latex, annotations: pr.annotations, figures: pr.figures };
+    });
+    const system = "You are a strict JSON-only window organizer.";
+    const userText = buildWindowPlanPrompt({ windowPages });
+    const resp = stripCodeFences(await llmCall(plannerCfg, { system, userText, imageDataUrl: null, signal: null }));
+    const parsed = safeJsonParse(resp);
+    if (!parsed.ok) throw new Error(`Window plan invalid JSON (window pages ${chunk[0]}-${chunk[chunk.length - 1]}).`);
+    const out = parsed.value || {};
+    return {
+      window_pages: chunk,
+      insertions: Array.isArray(out.insertions) ? out.insertions : [],
+    };
+  }
+
+  async function workerLoop(workerId) {
+    while (true) {
+      const idx = nextIdx;
+      nextIdx++;
+      if (idx >= pageChunks.length) return;
+      setStage(`Window assemble: worker ${workerId} window ${idx + 1}/${pageChunks.length}`);
+      setPageProgress(`${idx + 1} / ${pageChunks.length}`, idx / pageChunks.length);
+      results[idx] = await runOne(idx);
+    }
+  }
+
+  const n = Math.min(orgConc, pageChunks.length);
+  const workers = [];
+  for (let w = 0; w < n; w++) workers.push(workerLoop(w + 1));
+  await Promise.all(workers);
+  setPageProgress(`${pageChunks.length} / ${pageChunks.length}`, 1);
+  setStage("Window assemble: done");
+  return results.filter(Boolean);
+}
+
+function mergeInsertionsFromWindowPlans(windowPlans) {
+  const headings = collectHeadingsInOrder().filter((h) => String(h.text || "").trim().length > 0);
+  const evSet = new Set(headings.map((h) => `${h.page}||${String(h.evidence || "").trim()}||${String(h.text || "").trim()}`));
+
+  const merged = [];
+  const seen = new Set();
+  for (const wp of windowPlans || []) {
+    const ins = Array.isArray(wp.insertions) ? wp.insertions : [];
+    for (const it of ins) {
+      const page = Number(it.page);
+      const title = String(it.title || "").trim();
+      const evidence = String(it.evidence || "").trim();
+      const level = String(it.level || "").toLowerCase();
+      const evKey = `${page}||${evidence}||${title}`;
+      if (!evSet.has(evKey)) continue; // enforce explicit evidence
+      const key = `${page}||${level}||${title}||${evidence}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      merged.push({ page, level, title, evidence });
+    }
+  }
+  if (!merged.length) {
+    // fallback to raw per-page headings
+    return headings.map((h) => ({ page: h.page, level: h.level, title: h.text, evidence: h.evidence }));
+  }
+  merged.sort((a, b) => (a.page - b.page) || a.title.localeCompare(b.title));
+  return merged;
+}
+
+function buildMainTexFromPagesWithInsertions(insertions) {
+  const pages = Array.from(state.pageResults.keys()).sort((a, b) => a - b);
+  if (!pages.length) throw new Error("No per-page results yet.");
+  const byPage = new Map();
+  for (const it of insertions || []) {
+    const p = Number(it.page);
+    if (!Number.isFinite(p)) continue;
+    const arr = byPage.get(p) || [];
+    arr.push(it);
+    byPage.set(p, arr);
+  }
+
+  let body = "";
+  for (const p of pages) {
+    body += `\n%% ===== PAGE ${p} START =====\n`;
+    const ins = byPage.get(p) || [];
+    for (const it of ins) {
+      const { cmd, rank } = mapHeadingLevel(it.level);
+      if (!cmd || rank === 99) continue;
+      const title = String(it.title || "").trim().replace(/[{}]/g, "");
+      body += `${cmd}{${title}} % evidence: ${String(it.evidence || "").replace(/\s+/g, " ").slice(0, 160)}\n`;
+    }
+    const pr = state.pageResults.get(p);
+    body += (pr && pr.latex ? pr.latex : "") + "\n";
+    body += `%% ===== PAGE ${p} END =====\n`;
+  }
+  const preamble = buildLatexPreamble($("latexTemplate").value);
+  return preamble + body + "\n\\end{document}\n";
+}
+
 function flattenImagesList() {
   const arr = Array.from(state.images.values()).map((img) => ({
     id: img.id,
@@ -1350,15 +1603,23 @@ function updateOutputsPanels() {
 }
 
 async function organizeAndGenerateTex() {
-  setStage("Organize: start");
-  // Always use LLM organization + explicit-evidence validation.
-  // If evidence validation fails, organizeWithLlm() will automatically fall back to deterministic.
-  const result = await organizeWithLlm();
-  if (result.organizerIssues && result.organizerIssues.length) {
-    log(`Organizer issues: ${JSON.stringify(result.organizerIssues).slice(0, 500)}…`);
+  // New workflow:
+  // 1) window assemble (concurrent)
+  // 2) global assemble: ALWAYS include all per-page LaTeX into main.tex
+  setStage("Assemble: start");
+
+  if (!state.windowPlans || state.windowPlans.length === 0) {
+    // Build window plans first if not present.
+    state.windowPlans = await buildWindowPlansConcurrently();
   }
-  state.sectionTree = result.sectionTree;
-  state.mainTex = result.mainTex;
+
+  // Build section tree deterministically from explicit per-page headings (safe)
+  const headings = collectHeadingsInOrder().filter((h) => String(h.text || "").trim().length > 0);
+  state.sectionTree = buildSectionTreeFromHeadings(headings);
+
+  // Insertions: use window plans if they match explicit evidence; otherwise fall back to raw headings.
+  const insertions = mergeInsertionsFromWindowPlans(state.windowPlans);
+  state.mainTex = buildMainTexFromPagesWithInsertions(insertions);
 
   const verify = await verifyIfEnabled(state.mainTex);
   if (verify && Array.isArray(verify.issues) && verify.issues.length) {
@@ -1371,8 +1632,8 @@ async function organizeAndGenerateTex() {
   }
 
   updateOutputsPanels();
-  setStage("Organize: done");
-  log("Organization done.");
+  setStage("Assemble: done");
+  log("Assemble done.");
 }
 
 async function exportZip() {
@@ -1419,10 +1680,46 @@ async function exportZip() {
   log("ZIP downloaded.");
 }
 
+function downloadBlob(filename, blob) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+}
+
+function downloadText(filename, text) {
+  downloadBlob(filename, new Blob([text], { type: "text/plain;charset=utf-8" }));
+}
+
+function downloadJson(filename, obj) {
+  downloadText(filename, JSON.stringify(obj, null, 2));
+}
+
+async function exportPagesZip() {
+  if (!window.JSZip) throw new Error("JSZip missing.");
+  const zip = new window.JSZip();
+  const pagesArr = Array.from(state.pageResults.values()).sort((a, b) => a.page - b.page);
+  for (const p of pagesArr) {
+    zip.file(`page_${pad3(p.page)}.json`, JSON.stringify(p.raw || p, null, 2));
+  }
+  const blob = await zip.generateAsync({ type: "blob" });
+  downloadBlob("pages.zip", blob);
+}
+
+async function exportImagesZipOnly() {
+  if (!window.JSZip) throw new Error("JSZip missing.");
+  const zip = new window.JSZip();
+  const imgs = Array.from(state.images.values()).sort((a, b) => (a.page - b.page) || a.id.localeCompare(b.id));
+  for (const img of imgs) zip.file(img.filename, img.blob);
+  const blob = await zip.generateAsync({ type: "blob" });
+  downloadBlob("images.zip", blob);
+}
+
 async function exportWorkRecordZip() {
   if (!window.JSZip) throw new Error("JSZip missing.");
   if (!state.pdfBytes) throw new Error("PDF not loaded.");
-  const range = state.run.lastRange || getPageRange();
+  const range = state.run.lastRange || { start: 1, end: state.totalPages || 0 };
 
   setStage("Export: work record");
   setPageProgress("—", 0);
@@ -1676,6 +1973,22 @@ function wireUi() {
     }
   });
 
+  $("windowAssembleBtn").addEventListener("click", async () => {
+    setUiBusy(true);
+    try {
+      if (!state.pageResults.size) throw new Error("No per-page results yet. Run transcription first.");
+      setStage("Window assemble: start");
+      state.windowPlans = await buildWindowPlansConcurrently();
+      log(`Window assemble done: windows=${state.windowPlans.length}`);
+      updateOutputsPanels();
+    } catch (e) {
+      log(String(e && e.message ? e.message : e));
+      setStage("Error");
+    } finally {
+      setUiBusy(false);
+    }
+  });
+
   $("organizeBtn").addEventListener("click", async () => {
     setUiBusy(true);
     try {
@@ -1763,6 +2076,28 @@ function wireUi() {
       setUiBusy(false);
     }
   });
+
+  $("downloadMainTexBtn").addEventListener("click", () => {
+    if (!state.mainTex) return log("No main.tex yet.");
+    downloadText("main.tex", state.mainTex);
+  });
+  $("downloadSectionTreeBtn").addEventListener("click", () => downloadJson("section_tree.json", state.sectionTree || {}));
+  $("downloadImagesJsonBtn").addEventListener("click", () => downloadJson("images.json", flattenImagesList()));
+  $("downloadPagesZipBtn").addEventListener("click", async () => {
+    try {
+      await exportPagesZip();
+    } catch (e) {
+      log(String(e && e.message ? e.message : e));
+    }
+  });
+  $("downloadImagesZipBtn").addEventListener("click", async () => {
+    try {
+      await exportImagesZipOnly();
+    } catch (e) {
+      log(String(e && e.message ? e.message : e));
+    }
+  });
+  $("downloadWindowPlansBtn").addEventListener("click", () => downloadJson("window_plans.json", state.windowPlans || []));
 
   $("resetBtn").addEventListener("click", () => resetState());
 }
