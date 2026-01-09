@@ -66,7 +66,7 @@
           </div>
         </div>
 
-        <div class="grid grid--3">
+        <div class="grid grid--2">
           <div class="field">
             <label class="field__label" id="lblTemplate">LaTeX 模板</label>
             <select class="field__input" id="latexTemplate">
@@ -77,23 +77,12 @@
           </div>
 
           <div class="field">
-            <label class="field__label" id="lblOrganizerMode">章节组织</label>
-            <select class="field__input" id="organizerMode">
-              <option value="deterministic">确定性（仅显式证据）</option>
-              <option value="llm">LLM（仍需显式证据校验）</option>
-            </select>
-            <div class="field__hint" id="hintOrganizerMode">
-              “先转写后组织”：先按页产出，再做跨页组织（含滑动窗口）。
-            </div>
-          </div>
-
-          <div class="field">
-            <label class="field__label" id="lblWindow">跨页窗口</label>
+            <label class="field__label" id="lblWindow">跨页窗口（LLM 组织 + 证据校验）</label>
             <div class="inline">
               <input class="field__input" id="organizerWindow" type="number" min="3" max="15" step="1" value="7" />
               <input class="field__input" id="organizerOverlap" type="number" min="0" max="5" step="1" value="1" />
             </div>
-            <div class="field__hint" id="hintWindow">窗口大小 / 重叠页数（仅在 LLM 组织时使用）。</div>
+            <div class="field__hint" id="hintWindow">窗口大小 / 重叠页数（用于跨页组织的稳定性）。</div>
           </div>
         </div>
       </section>
@@ -398,14 +387,9 @@
       </footer>
     </main>
 
-    <!-- pdf.js (vendored; render-only usage) -->
-    <script type="module">
-      import * as pdfjsLib from "./vendor/pdfjs/pdf.min.mjs";
-      window.pdfjsLib = pdfjsLib;
-    </script>
     <!-- jszip -->
     <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
-    <script src="./app.js"></script>
+    <script type="module" src="./app.js"></script>
   </body>
 </html>
 

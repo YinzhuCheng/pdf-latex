@@ -1,5 +1,7 @@
 /* eslint-disable no-console */
 
+import * as pdfjsLib from "./vendor/pdfjs/pdf.min.mjs";
+
 // ---------------------------
 // Utilities
 // ---------------------------
@@ -76,10 +78,8 @@ const I18N = {
     hintRender: "值越大越清晰但更慢；建议 1.5–2.5。",
     lblTemplate: "LaTeX 模板",
     hintTemplate: "影响导出的 `main.tex` 头部。",
-    lblOrganizerMode: "章节组织",
-    hintOrganizerMode: "“先转写后组织”：先按页产出，再做跨页组织（含滑动窗口）。",
     lblWindow: "跨页窗口",
-    hintWindow: "窗口大小 / 重叠页数（仅在 LLM 组织时使用）。",
+    hintWindow: "窗口大小 / 重叠页数（用于跨页组织的稳定性）。",
     secLlmTitle: "大模型设置（统一入口 + 多角色）",
     secLlmDesc: "允许为规划/转写/后校验分别配置不同的 key/url/model，并提供连通性测试。",
     sumGlobal: "全局默认（可被角色覆盖）",
@@ -134,10 +134,8 @@ const I18N = {
     hintRender: "Higher is clearer but slower; recommended 1.5–2.5.",
     lblTemplate: "LaTeX template",
     hintTemplate: "Affects the header of exported `main.tex`.",
-    lblOrganizerMode: "Organization",
-    hintOrganizerMode: "\"Transcribe first, organize later\": per-page output first, then cross-page organization (with sliding windows).",
     lblWindow: "Cross-page window",
-    hintWindow: "Window size / overlap pages (used only in LLM organization mode).",
+    hintWindow: "Window size / overlap pages (for cross-page organization stability).",
     secLlmTitle: "LLM settings (unified + multi-role)",
     secLlmDesc: "Configure different key/url/model for planner/transcriber/verifier, with connectivity tests.",
     sumGlobal: "Global defaults (role overrides allowed)",
@@ -200,8 +198,6 @@ function applyI18n() {
     hintRender: "hintRender",
     lblTemplate: "lblTemplate",
     hintTemplate: "hintTemplate",
-    lblOrganizerMode: "lblOrganizerMode",
-    hintOrganizerMode: "hintOrganizerMode",
     lblWindow: "lblWindow",
     hintWindow: "hintWindow",
     secLlmTitle: "secLlmTitle",
@@ -358,10 +354,9 @@ function setLang(lang) {
 // ---------------------------
 
 function initPdfJs() {
-  if (!window.pdfjsLib) throw new Error("pdfjsLib missing");
   // Use vendored worker (no CDN dependency).
-  // eslint-disable-next-line no-undef
-  pdfjsLib.GlobalWorkerOptions.workerSrc = "./vendor/pdfjs/pdf.worker.min.mjs";
+  // Ensure workerSrc is set before any getDocument() call.
+  pdfjsLib.GlobalWorkerOptions.workerSrc = new URL("./vendor/pdfjs/pdf.worker.min.mjs", import.meta.url).toString();
 }
 
 async function loadPdfFromInput() {
@@ -370,7 +365,6 @@ async function loadPdfFromInput() {
   state.pdfFile = file;
   state.pdfBytes = await file.arrayBuffer();
   setStage("PDF: loading…");
-  // eslint-disable-next-line no-undef
   state.pdfDoc = await pdfjsLib.getDocument({ data: state.pdfBytes }).promise;
   state.totalPages = state.pdfDoc.numPages;
   log(`Loaded PDF: ${file.name}, pages=${state.totalPages}`);
@@ -1215,14 +1209,11 @@ function updateOutputsPanels() {
 
 async function organizeAndGenerateTex() {
   setStage("Organize: start");
-  let result;
-  if ($("organizerMode").value === "llm") {
-    result = await organizeWithLlm();
-    if (result.organizerIssues && result.organizerIssues.length) {
-      log(`Organizer issues: ${JSON.stringify(result.organizerIssues).slice(0, 500)}…`);
-    }
-  } else {
-    result = buildLatexDocumentDeterministic();
+  // Always use LLM organization + explicit-evidence validation.
+  // If evidence validation fails, organizeWithLlm() will automatically fall back to deterministic.
+  const result = await organizeWithLlm();
+  if (result.organizerIssues && result.organizerIssues.length) {
+    log(`Organizer issues: ${JSON.stringify(result.organizerIssues).slice(0, 500)}…`);
   }
   state.sectionTree = result.sectionTree;
   state.mainTex = result.mainTex;
@@ -1450,18 +1441,12 @@ function boot() {
   setLang("zh");
   wireUi();
   resetState();
-  try {
-    initPdfJs();
-    applyProviderDefaultsTo("global");
-    applyProviderDefaultsTo("planner");
-    applyProviderDefaultsTo("transcriber");
-    applyProviderDefaultsTo("verifier");
-    log("Ready.");
-  } catch (e) {
-    setStage("Init error");
-    log(`Init error: ${String(e && e.message ? e.message : e)}`);
-    log("If PDF rendering fails, check that pdf.js CDN is reachable.");
-  }
+  initPdfJs();
+  applyProviderDefaultsTo("global");
+  applyProviderDefaultsTo("planner");
+  applyProviderDefaultsTo("transcriber");
+  applyProviderDefaultsTo("verifier");
+  log("Ready.");
 }
 
 boot();

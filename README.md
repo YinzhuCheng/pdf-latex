@@ -57,8 +57,7 @@
 ## 章节结构的“显式证据”原则
 
 - 每页转写会产出 `annotations.headings[]`，每个 heading 必须带 `evidence`（原文片段）
-- **确定性组织模式**：只用这些 heading 插入 `\section/\subsection...`，并据此构建 `section_tree.json`
-- **LLM 组织模式**：对滑动窗口做跨页组织，但会对 `section_tree` 做证据校验；若发现“无证据标题”，自动回退到确定性组织
+- **章节组织（固定为 LLM + 证据校验）**：对滑动窗口做跨页组织，并对 `section_tree` 做证据校验；若发现“无证据标题”，自动回退到确定性组织（仅显式证据）
 
 ---
 
