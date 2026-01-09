@@ -168,6 +168,7 @@ body{
 .toggle input{accent-color: var(--primary)}
 
 .actions{display:flex; flex-wrap:wrap; gap: 10px}
+.actions .btn--ghost{border-style:dashed}
 
 .progress{margin-top: 12px}
 .progress__row{display:flex; justify-content:space-between; gap: 10px; margin-bottom: 6px}

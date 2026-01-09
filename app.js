@@ -20,6 +20,10 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+function randInt(a, b) {
+  return Math.floor(a + Math.random() * (b - a + 1));
+}
+
 function clamp(n, a, b) {
   return Math.max(a, Math.min(b, n));
 }
@@ -49,6 +53,14 @@ function toBase64FromDataUrl(dataUrl) {
   const idx = dataUrl.indexOf("base64,");
   if (idx === -1) return "";
   return dataUrl.slice(idx + "base64,".length);
+}
+
+async function sha256Hex(arrayBuffer) {
+  const hash = await crypto.subtle.digest("SHA-256", arrayBuffer);
+  const bytes = new Uint8Array(hash);
+  return Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 }
 
 function pad3(n) {
@@ -269,12 +281,22 @@ const state = {
   pdfBytes: null,
   pdfDoc: null,
   totalPages: 0,
+  pdfSha256: null,
   // pageNum -> { page, width, height, latex, annotations, figures, raw }
   pageResults: new Map(),
   // imageId -> { id, filename, page, bbox, blob, referencedIn }
   images: new Map(),
   sectionTree: null,
   mainTex: "",
+
+  // run control
+  run: {
+    inProgress: false,
+    cancelRequested: false,
+    earlyExportRequested: false,
+    controller: null, // AbortController for current batch
+    lastRange: null, // {start,end}
+  },
 };
 
 function resetState() {
@@ -282,10 +304,16 @@ function resetState() {
   state.pdfBytes = null;
   state.pdfDoc = null;
   state.totalPages = 0;
+  state.pdfSha256 = null;
   state.pageResults.clear();
   state.images.clear();
   state.sectionTree = null;
   state.mainTex = "";
+  state.run.inProgress = false;
+  state.run.cancelRequested = false;
+  state.run.earlyExportRequested = false;
+  state.run.controller = null;
+  state.run.lastRange = null;
   $("treeBox").textContent = "{}";
   $("texBox").textContent = "";
   $("imagesBox").textContent = "[]";
@@ -327,8 +355,14 @@ function setUiBusy(isBusy) {
     "plannerConnTestBtn",
     "transcriberConnTestBtn",
     "verifierConnTestBtn",
+    "importWorkRecordBtn",
+    "exportWorkRecordBtn",
   ];
   for (const id of ids) $(id).disabled = isBusy;
+  // Stop/continue are special: stop is enabled while running; continue enabled when not running.
+  $("stopBtn").disabled = !isBusy;
+  $("continueBtn").disabled = isBusy;
+  $("earlyExportBtn").disabled = !isBusy;
   document.body.style.cursor = isBusy ? "progress" : "default";
 }
 
@@ -364,6 +398,7 @@ async function loadPdfFromInput() {
   if (!file) throw new Error("Please choose a PDF file.");
   state.pdfFile = file;
   state.pdfBytes = await file.arrayBuffer();
+  state.pdfSha256 = await sha256Hex(state.pdfBytes);
   setStage("PDF: loading…");
   state.pdfDoc = await pdfjsLib.getDocument({ data: state.pdfBytes }).promise;
   state.totalPages = state.pdfDoc.numPages;
@@ -435,6 +470,12 @@ function readJsonHeaders(input) {
     throw new Error("Extra headers must be a JSON object.");
   }
   return parsed.value;
+}
+
+function getRunSettings() {
+  const concurrency = clamp(Number($("concurrency").value || 1), 1, 8);
+  const maxRetries = clamp(Number($("maxRetries").value || 0), 0, 10);
+  return { concurrency, maxRetries };
 }
 
 function getGlobalConfig() {
@@ -526,7 +567,7 @@ async function fetchJson(url, options) {
   return parsed.value;
 }
 
-async function callOpenAI(cfg, { system, userText, imageDataUrl }) {
+async function callOpenAI(cfg, { system, userText, imageDataUrl, signal }) {
   const url = cfg.baseUrl.replace(/\/$/, "") + "/v1/chat/completions";
   const headers = {
     Authorization: `Bearer ${cfg.apiKey}`,
@@ -546,14 +587,14 @@ async function callOpenAI(cfg, { system, userText, imageDataUrl }) {
       { role: "user", content },
     ],
   };
-  const data = await fetchJson(url, { method: "POST", headers, body: JSON.stringify(body) });
+  const data = await fetchJson(url, { method: "POST", headers, body: JSON.stringify(body), signal });
   const msg = data.choices && data.choices[0] && data.choices[0].message;
   const text = msg && msg.content;
   if (!text) throw new Error("OpenAI: empty response.");
   return String(text);
 }
 
-async function callClaude(cfg, { system, userText, imageDataUrl }) {
+async function callClaude(cfg, { system, userText, imageDataUrl, signal }) {
   const url = cfg.baseUrl.replace(/\/$/, "") + "/v1/messages";
   const headers = {
     "x-api-key": cfg.apiKey,
@@ -580,7 +621,7 @@ async function callClaude(cfg, { system, userText, imageDataUrl }) {
     system: system ? [{ type: "text", text: system }] : undefined,
     messages: [{ role: "user", content }],
   };
-  const data = await fetchJson(url, { method: "POST", headers, body: JSON.stringify(body) });
+  const data = await fetchJson(url, { method: "POST", headers, body: JSON.stringify(body), signal });
   const parts = data.content;
   const textPart = Array.isArray(parts) ? parts.find((p) => p && p.type === "text") : null;
   const text = textPart && textPart.text;
@@ -588,7 +629,7 @@ async function callClaude(cfg, { system, userText, imageDataUrl }) {
   return String(text);
 }
 
-async function callGemini(cfg, { system, userText, imageDataUrl }) {
+async function callGemini(cfg, { system, userText, imageDataUrl, signal }) {
   // Gemini uses API key in query string by default.
   // Support proxy patterns where key isn't required in query; still accept.
   const base = cfg.baseUrl.replace(/\/$/, "");
@@ -627,7 +668,7 @@ async function callGemini(cfg, { system, userText, imageDataUrl }) {
     "Content-Type": "application/json",
     ...cfg.extraHeaders,
   };
-  const data = await fetchJson(url, { method: "POST", headers, body: JSON.stringify(body) });
+  const data = await fetchJson(url, { method: "POST", headers, body: JSON.stringify(body), signal });
   const cand = data.candidates && data.candidates[0];
   const outParts = cand && cand.content && cand.content.parts;
   const textPart = Array.isArray(outParts) ? outParts.find((p) => p && typeof p.text === "string") : null;
@@ -647,11 +688,42 @@ async function llmCall(cfgIn, payload) {
   throw new Error(`Unknown provider: ${cfg.provider}`);
 }
 
+function shouldRetryError(err) {
+  if (!err) return false;
+  if (err.name === "AbortError") return false;
+  const status = err.status;
+  if (typeof status === "number") {
+    if (status === 429) return true;
+    if (status >= 500 && status <= 599) return true;
+    return false; // do not retry typical 4xx auth/model errors
+  }
+  // Network error (e.g., "Failed to fetch")
+  return true;
+}
+
+async function llmCallWithRetry(cfg, payload, { maxRetries }) {
+  let attempt = 0;
+  // attempts = 1 + maxRetries
+  while (true) {
+    try {
+      return await llmCall(cfg, payload);
+    } catch (e) {
+      attempt++;
+      const canRetry = attempt <= maxRetries && shouldRetryError(e);
+      const msg = String(e && e.message ? e.message : e);
+      if (!canRetry) throw e;
+      const backoffMs = Math.min(30000, 800 * Math.pow(2, attempt - 1) + randInt(0, 600));
+      log(`LLM call failed (attempt ${attempt}/${maxRetries}). Retrying in ${backoffMs}ms. Error: ${msg.slice(0, 200)}`);
+      await sleep(backoffMs);
+    }
+  }
+}
+
 async function connectivityTest(cfgIn) {
   const cfg = normalizeProviderDefaults(cfgIn);
   const sys = "You are a connectivity test endpoint. Reply with exactly: OK";
   const user = "Reply with exactly: OK";
-  const text = await llmCall(cfg, { system: sys, userText: user, imageDataUrl: null });
+  const text = await llmCall(cfg, { system: sys, userText: user, imageDataUrl: null, signal: null });
   if (String(text).trim() !== "OK") throw new Error(`Unexpected response: ${String(text).slice(0, 200)}`);
   return true;
 }
@@ -796,20 +868,59 @@ function extractIncludeGraphicsIds(latex) {
 async function transcribeAndCrop() {
   if (!state.pdfDoc) throw new Error("PDF not loaded.");
   const { start, end } = getPageRange();
+  state.run.lastRange = { start, end };
   const scale = Number($("renderScale").value || 2);
 
   const transcriberCfg = getRoleConfig("transcriber");
+  const { concurrency, maxRetries } = getRunSettings();
+
+  // Breakpoint: skip pages already present
+  const pagesToDo = [];
+  for (let p = start; p <= end; p++) {
+    if (!state.pageResults.has(p)) pagesToDo.push(p);
+  }
+  if (!pagesToDo.length) {
+    log("All pages in range are already transcribed. Nothing to do.");
+    setStage("Transcribe: done");
+    setPageProgress(`${end} / ${end}`, 1);
+    return;
+  }
 
   setStage("Transcribe: start");
-  const total = end - start + 1;
-  for (let i = 0; i < total; i++) {
-    const pageNum = start + i;
-    setPageProgress(`${pageNum} / ${end}`, i / total);
-    setStage(`Transcribe: rendering page ${pageNum}`);
+  state.run.inProgress = true;
+  state.run.cancelRequested = false;
+  state.run.earlyExportRequested = false;
+  state.run.controller = new AbortController();
+
+  const totalTarget = end - start + 1;
+  let completedInRange = totalTarget - pagesToDo.length;
+  let completedThisBatch = 0;
+  let nextIdx = 0;
+  const signal = state.run.controller.signal;
+
+  function updateProgress() {
+    const done = completedInRange + completedThisBatch;
+    setPageProgress(`${done} / ${totalTarget}`, totalTarget ? done / totalTarget : 1);
+  }
+  updateProgress();
+
+  function uniqueImageId(desiredId) {
+    let id = desiredId;
+    let k = 2;
+    while (state.images.has(id)) {
+      id = `${desiredId}_v${k}`;
+      k++;
+    }
+    return id;
+  }
+
+  async function processOnePage(pageNum) {
+    if (state.run.cancelRequested) return;
+    setStage(`Transcribe: page ${pageNum}`);
     log(`Rendering page ${pageNum}…`);
     const { canvas, width, height } = await renderPageToCanvas(pageNum, scale);
 
-    // show preview as we go
+    // best-effort preview: show last rendered page
     const out = $("previewCanvas");
     out.width = canvas.width;
     out.height = canvas.height;
@@ -818,42 +929,44 @@ async function transcribeAndCrop() {
     const dataUrl = canvas.toDataURL("image/png");
     const system = "You are a careful math textbook transcriber. Output JSON only.";
     const userText = buildTranscriptionPrompt({ pageNum, width, height });
-    setStage(`Transcribe: LLM page ${pageNum}`);
     log(`Calling LLM for page ${pageNum}…`);
 
-    let respText = await llmCall(transcriberCfg, { system, userText, imageDataUrl: dataUrl });
+    let respText = await llmCallWithRetry(
+      transcriberCfg,
+      { system, userText, imageDataUrl: dataUrl, signal },
+      { maxRetries }
+    );
     respText = stripCodeFences(respText);
 
+    // If it isn't JSON, do one stricter retry (counts as one attempt through retry wrapper above, so do it manually here)
     const parsed = safeJsonParse(respText);
     if (!parsed.ok) {
-      log(`LLM output not JSON on page ${pageNum}. Will retry once with a stricter prompt.`);
-      await sleep(250);
-      const userText2 =
-        userText +
-        "\n\n再次强调：必须输出严格 JSON，且不要使用 Markdown 代码块或任何额外文字。";
-      respText = await llmCall(transcriberCfg, { system, userText: userText2, imageDataUrl: dataUrl });
+      log(`Page ${pageNum}: output not JSON. Retrying once with stricter JSON-only instruction.`);
+      const userText2 = userText + "\n\n再次强调：必须输出严格 JSON，且不要使用 Markdown 代码块或任何额外文字。";
+      respText = await llmCallWithRetry(
+        transcriberCfg,
+        { system, userText: userText2, imageDataUrl: dataUrl, signal },
+        { maxRetries }
+      );
       respText = stripCodeFences(respText);
     }
     const parsed2 = safeJsonParse(respText);
-    if (!parsed2.ok) {
-      throw new Error(`Page ${pageNum}: LLM output is not valid JSON.`);
-    }
+    if (!parsed2.ok) throw new Error(`Page ${pageNum}: LLM output is not valid JSON.`);
     const obj = parsed2.value;
 
-    if (obj.page !== pageNum) {
-      log(`Warning: page mismatch. expected=${pageNum}, got=${obj.page}`);
-    }
     const latex = typeof obj.latex === "string" ? obj.latex : "";
-    const annotations = obj.annotations && typeof obj.annotations === "object" ? obj.annotations : { headings: [], notes: [] };
+    const annotations =
+      obj.annotations && typeof obj.annotations === "object" ? obj.annotations : { headings: [], notes: [] };
     const figures = Array.isArray(obj.figures) ? obj.figures : [];
 
-    // Crop figures
+    // Crop figures (LLM decides which real figures to keep; if none -> no image saved)
     for (let fi = 0; fi < figures.length; fi++) {
       const fig = figures[fi] || {};
-      const id = String(fig.id || `p${pageNum}_fig${fi + 1}`);
+      const desired = String(fig.id || `p${pageNum}_fig${fi + 1}`);
+      const id = uniqueImageId(desired);
       const bbox = normalizeBbox(fig.bbox, width, height);
       if (!bbox) {
-        log(`Page ${pageNum}: skip figure ${id} (invalid bbox).`);
+        log(`Page ${pageNum}: skip figure ${desired} (invalid bbox).`);
         continue;
       }
       const blob = await cropPngFromCanvas(canvas, bbox);
@@ -879,8 +992,6 @@ async function transcribeAndCrop() {
       const img = state.images.get(id);
       if (img) {
         if (!img.referencedIn.includes(pageNum)) img.referencedIn.push(pageNum);
-      } else {
-        // We'll still list it later for diagnostics.
       }
     }
 
@@ -893,13 +1004,44 @@ async function transcribeAndCrop() {
       figures,
       raw: obj,
     });
-
     log(`Transcribed page ${pageNum}: latex_chars=${latex.length}, figures=${figures.length}`);
     updateOutputsPanels();
   }
-  setPageProgress(`${end} / ${end}`, 1);
-  setStage("Transcribe: done");
-  log("Transcription done.");
+
+  async function workerLoop(workerId) {
+    while (true) {
+      if (state.run.cancelRequested) return;
+      const idx = nextIdx;
+      nextIdx++;
+      if (idx >= pagesToDo.length) return;
+      const pageNum = pagesToDo[idx];
+      try {
+        await processOnePage(pageNum);
+      } catch (e) {
+        if (e && e.name === "AbortError") {
+          log(`Worker ${workerId}: aborted.`);
+          return;
+        }
+        log(`Page ${pageNum}: failed: ${String(e && e.message ? e.message : e)}`);
+        throw e;
+      } finally {
+        completedThisBatch++;
+        updateProgress();
+      }
+    }
+  }
+
+  try {
+    const workers = [];
+    const n = Math.min(concurrency, pagesToDo.length);
+    for (let w = 0; w < n; w++) workers.push(workerLoop(w + 1));
+    await Promise.all(workers);
+    setStage("Transcribe: done");
+    log("Transcription done.");
+  } finally {
+    state.run.inProgress = false;
+    state.run.controller = null;
+  }
 }
 
 // ---------------------------
@@ -1277,6 +1419,135 @@ async function exportZip() {
   log("ZIP downloaded.");
 }
 
+async function exportWorkRecordZip() {
+  if (!window.JSZip) throw new Error("JSZip missing.");
+  if (!state.pdfBytes) throw new Error("PDF not loaded.");
+  const range = state.run.lastRange || getPageRange();
+
+  setStage("Export: work record");
+  setPageProgress("—", 0);
+
+  const zip = new window.JSZip();
+  const pagesArr = Array.from(state.pageResults.values()).sort((a, b) => a.page - b.page);
+  const imgs = Array.from(state.images.values()).sort((a, b) => (a.page - b.page) || a.id.localeCompare(b.id));
+
+  const record = {
+    version: 1,
+    created_at: nowIso(),
+    pdf: {
+      name: state.pdfFile ? state.pdfFile.name : null,
+      sha256: state.pdfSha256,
+      total_pages: state.totalPages,
+    },
+    range,
+    pages_done: pagesArr.map((p) => p.page),
+    images: imgs.map((img) => ({
+      id: img.id,
+      filename: img.filename,
+      page: img.page,
+      bbox: img.bbox,
+      referenced_in: img.referencedIn,
+      evidence: img.evidence || "",
+    })),
+  };
+  zip.file("work_record.json", JSON.stringify(record, null, 2));
+
+  const pagesFolder = zip.folder("pages");
+  for (const p of pagesArr) {
+    pagesFolder.file(`page_${pad3(p.page)}.json`, JSON.stringify(p.raw || p, null, 2));
+  }
+
+  for (let i = 0; i < imgs.length; i++) {
+    setPageProgress(`${i + 1} / ${imgs.length}`, imgs.length ? i / imgs.length : 1);
+    zip.file(imgs[i].filename, imgs[i].blob);
+  }
+
+  const blob = await zip.generateAsync({ type: "blob" }, (meta) => {
+    if (meta && typeof meta.percent === "number") {
+      setPageProgress(`${meta.percent.toFixed(0)}%`, meta.percent / 100);
+    }
+  });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  const base = state.pdfFile ? state.pdfFile.name.replace(/\.pdf$/i, "") : "work";
+  a.href = url;
+  a.download = `${base}_work_record.zip`;
+  a.click();
+  setStage("Export: work record done");
+  setPageProgress("100%", 1);
+  log("Work record ZIP downloaded.");
+}
+
+async function importWorkRecordZip() {
+  if (!window.JSZip) throw new Error("JSZip missing.");
+  const file = $("workRecordFile").files && $("workRecordFile").files[0];
+  if (!file) throw new Error("Please choose a work record ZIP.");
+  if (!state.pdfBytes) throw new Error("Load the PDF first, then import the work record.");
+
+  setStage("Import: work record");
+  setPageProgress("—", 0);
+  const buf = await file.arrayBuffer();
+  const zip = await window.JSZip.loadAsync(buf);
+  const recordText = await zip.file("work_record.json").async("string");
+  const parsed = safeJsonParse(recordText);
+  if (!parsed.ok) throw new Error("Invalid work_record.json in ZIP.");
+  const record = parsed.value;
+  if (!record.pdf || record.pdf.sha256 !== state.pdfSha256) {
+    throw new Error("Work record PDF fingerprint does not match the currently loaded PDF.");
+  }
+
+  // Load page JSONs
+  const pageFiles = Object.keys(zip.files).filter((p) => p.startsWith("pages/") && p.endsWith(".json"));
+  for (let i = 0; i < pageFiles.length; i++) {
+    const path = pageFiles[i];
+    const txt = await zip.file(path).async("string");
+    const pj = safeJsonParse(txt);
+    if (!pj.ok) continue;
+    const obj = pj.value;
+    const pageNum = Number(obj.page || obj.raw?.page);
+    if (!Number.isFinite(pageNum)) continue;
+    if (state.pageResults.has(pageNum)) continue;
+    const latex = typeof obj.latex === "string" ? obj.latex : (obj.raw && typeof obj.raw.latex === "string" ? obj.raw.latex : "");
+    const annotations = obj.annotations || (obj.raw ? obj.raw.annotations : null) || { headings: [], notes: [] };
+    const figures = obj.figures || (obj.raw ? obj.raw.figures : null) || [];
+    state.pageResults.set(pageNum, {
+      page: pageNum,
+      width: obj.width || 0,
+      height: obj.height || 0,
+      latex,
+      annotations,
+      figures,
+      raw: obj.raw || obj,
+    });
+  }
+
+  // Load PNGs (top-level)
+  const pngFiles = Object.keys(zip.files).filter((p) => p.endsWith(".png") && !p.includes("/"));
+  for (let i = 0; i < pngFiles.length; i++) {
+    const name = pngFiles[i];
+    const blob = await zip.file(name).async("blob");
+    const id = name.replace(/\.png$/i, "");
+    if (!state.images.has(id)) {
+      const meta = (record.images || []).find((x) => x && x.id === id);
+      state.images.set(id, {
+        id,
+        filename: name,
+        page: meta ? meta.page : 0,
+        bbox: meta ? meta.bbox : null,
+        blob,
+        referencedIn: meta ? (meta.referenced_in || []) : [],
+        evidence: meta ? (meta.evidence || "") : "",
+      });
+    }
+  }
+
+  state.run.lastRange = record.range || state.run.lastRange;
+  updateOutputsPanels();
+  setStage("Import: done");
+  setPageProgress("100%", 1);
+  log(`Imported work record: pages=${state.pageResults.size}, images=${state.images.size}`);
+}
+
 // ---------------------------
 // UI wiring
 // ---------------------------
@@ -1421,6 +1692,70 @@ function wireUi() {
     setUiBusy(true);
     try {
       await exportZip();
+    } catch (e) {
+      log(String(e && e.message ? e.message : e));
+      setStage("Error");
+    } finally {
+      setUiBusy(false);
+    }
+  });
+
+  $("exportWorkRecordBtn").addEventListener("click", async () => {
+    setUiBusy(true);
+    try {
+      await exportWorkRecordZip();
+    } catch (e) {
+      log(String(e && e.message ? e.message : e));
+      setStage("Error");
+    } finally {
+      setUiBusy(false);
+    }
+  });
+
+  $("importWorkRecordBtn").addEventListener("click", async () => {
+    setUiBusy(true);
+    try {
+      await importWorkRecordZip();
+    } catch (e) {
+      log(String(e && e.message ? e.message : e));
+      setStage("Error");
+    } finally {
+      setUiBusy(false);
+    }
+  });
+
+  $("stopBtn").addEventListener("click", () => {
+    if (!state.run.inProgress) return;
+    state.run.cancelRequested = true;
+    if (state.run.controller) state.run.controller.abort();
+    setStage("Stopping…");
+    log("Stop requested.");
+  });
+
+  $("earlyExportBtn").addEventListener("click", async () => {
+    if (!state.run.inProgress) return;
+    state.run.earlyExportRequested = true;
+    state.run.cancelRequested = true;
+    if (state.run.controller) state.run.controller.abort();
+    setStage("Early stop: exporting…");
+    log("Early stop requested: will export work record.");
+    // Best-effort export of current results
+    setUiBusy(true);
+    try {
+      await exportWorkRecordZip();
+    } catch (e) {
+      log(String(e && e.message ? e.message : e));
+      setStage("Error");
+    } finally {
+      setUiBusy(false);
+    }
+  });
+
+  $("continueBtn").addEventListener("click", async () => {
+    if (state.run.inProgress) return;
+    setUiBusy(true);
+    try {
+      await transcribeAndCrop();
     } catch (e) {
       log(String(e && e.message ? e.message : e));
       setStage("Error");

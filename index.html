@@ -318,11 +318,36 @@
           <div class="card__desc" id="secRunDesc">按阶段执行，运行时显示进度与日志。</div>
         </div>
 
+        <div class="grid grid--3">
+          <div class="field">
+            <label class="field__label" id="lblConcurrency">并发数</label>
+            <input class="field__input" id="concurrency" type="number" min="1" max="8" step="1" value="2" />
+            <div class="field__hint" id="hintConcurrency">转写阶段同时处理的页数；过大可能触发限流/失败。</div>
+          </div>
+          <div class="field">
+            <label class="field__label" id="lblMaxRetries">最大重试次数</label>
+            <input class="field__input" id="maxRetries" type="number" min="0" max="10" step="1" value="3" />
+            <div class="field__hint" id="hintMaxRetries">网络错误/限流等会自动重试（带退避）。</div>
+          </div>
+          <div class="field">
+            <label class="field__label" id="lblWorkRecord">工作记录（断点续作）</label>
+            <div class="inline">
+              <input class="field__input" id="workRecordFile" type="file" accept=".zip,application/zip" />
+              <button class="btn btn--ghost" id="importWorkRecordBtn" type="button">导入</button>
+              <button class="btn btn--ghost" id="exportWorkRecordBtn" type="button">导出</button>
+            </div>
+            <div class="field__hint" id="hintWorkRecord">导出/导入包含已完成页 JSON 与剪裁 PNG，用于继续未完成页。</div>
+          </div>
+        </div>
+
         <div class="actions">
           <button class="btn btn--primary" id="loadPdfBtn" type="button">加载 PDF</button>
           <button class="btn btn--primary" id="transcribeBtn" type="button">1) 按页转写 + 剪裁出图</button>
           <button class="btn btn--primary" id="organizeBtn" type="button">2) 章节组织 + 生成 main.tex</button>
           <button class="btn btn--primary" id="exportBtn" type="button">3) 导出 ZIP</button>
+          <button class="btn btn--ghost" id="stopBtn" type="button">停止</button>
+          <button class="btn btn--ghost" id="continueBtn" type="button">继续</button>
+          <button class="btn btn--ghost" id="earlyExportBtn" type="button">早停导出</button>
           <button class="btn" id="resetBtn" type="button">重置</button>
         </div>
 
