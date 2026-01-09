@@ -3497,6 +3497,10 @@ function wireUi() {
   $("langEnBtn").addEventListener("click", () => setLang("en"));
   $("themeLightBtn").addEventListener("click", () => setTheme("light"));
   $("themeDarkBtn").addEventListener("click", () => setTheme("dark"));
+  
+  // 配置导入/导出按钮
+  $("exportConfigBtn").addEventListener("click", () => exportConfigToFile());
+  $("importConfigBtn").addEventListener("click", () => importConfigFromFile());
 
   // Provider defaults (only fill when fields are empty)
   $("globalProvider").addEventListener("change", () => applyProviderDefaultsTo("global"));
@@ -3986,24 +3990,13 @@ function importConfigFromFile() {
   input.click();
 }
 
-// 暴露到全局，方便控制台调用
+// 暴露到全局，方便控制台调用（可选）
 window.exportConfig = exportConfig;
 window.importConfig = importConfig;
 window.exportConfigToClipboard = exportConfigToClipboard;
 window.importConfigFromClipboard = importConfigFromClipboard;
 window.exportConfigToFile = exportConfigToFile;
 window.importConfigFromFile = importConfigFromFile;
-
-// 打印帮助信息
-console.log(`
-📋 PDF2LaTeX 配置命令行工具：
-  exportConfig()              - 获取配置对象
-  importConfig(cfg)           - 导入配置对象
-  exportConfigToClipboard()   - 复制配置到剪贴板
-  importConfigFromClipboard() - 从剪贴板导入配置
-  exportConfigToFile()        - 保存配置到文件
-  importConfigFromFile()      - 从文件导入配置
-`);
 
 // ---------------------------
 // Boot
