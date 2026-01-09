@@ -578,12 +578,14 @@ async function ocrExtractTextBlocks(canvas) {
 }
 
 // ---------------------------
-// Figure Caption Detection
+// Figure Caption Detection (改进版)
 // ---------------------------
 
 // 图标题正则模式（中英文）
 const FIGURE_CAPTION_PATTERNS = [
-  // 中文模式
+  // 中文模式 - 行首
+  /^图\s*[\(\（]?\s*[a-zA-Z0-9]+\s*[\)\）]?\s*(\d+(?:[.\-]\d+)*)?/i,
+  /^圖\s*[\(\（]?\s*[a-zA-Z0-9]+\s*[\)\）]?\s*(\d+(?:[.\-]\d+)*)?/i,
   /^图\s*(\d+(?:[.\-]\d+)*)/i,
   /^圖\s*(\d+(?:[.\-]\d+)*)/i,
   // 英文模式
@@ -592,22 +594,156 @@ const FIGURE_CAPTION_PATTERNS = [
   /^fig\s+(\d+(?:[.\-]\d+)*)/i,
 ];
 
-function isFigureCaption(text) {
-  const trimmed = (text || "").trim();
-  for (const pattern of FIGURE_CAPTION_PATTERNS) {
-    if (pattern.test(trimmed)) {
-      return true;
+// 段落内引用模式（不是标题）
+const FIGURE_REFERENCE_PATTERNS = [
+  /如图\s*[\(\（]?\s*[a-zA-Z0-9]+\s*[\)\）]?\s*所示/,
+  /见图\s*[\(\（]?\s*[a-zA-Z0-9]+\s*[\)\）]?/,
+  /由图\s*[\(\（]?\s*[a-zA-Z0-9]+\s*[\)\）]?/,
+  /在图\s*[\(\（]?\s*[a-zA-Z0-9]+\s*[\)\）]?\s*中/,
+  /as shown in fig/i,
+  /see figure/i,
+  /in figure/i,
+];
+
+/**
+ * 判断一行文字是否是"图内文字"（标注、坐标轴等）
+ * 特征：短、孤立、不成段落
+ */
+function isFigureInternalText(line, pageWidth, allLines) {
+  const lineWidth = line.bbox.w;
+  const widthRatio = lineWidth / pageWidth;
+  
+  // 非常短的文字（< 15% 页宽）很可能是图内标注
+  if (widthRatio < 0.15) {
+    return true;
+  }
+  
+  // 检查是否与其他行形成连续文字块
+  const lineY = line.bbox.y;
+  const lineH = line.bbox.h;
+  const lineX = line.bbox.x;
+  
+  // 计算有多少相邻行（y 坐标接近，x 坐标对齐）
+  let adjacentLines = 0;
+  for (const other of allLines) {
+    if (other === line) continue;
+    
+    const yDiff = Math.abs(other.bbox.y - lineY);
+    const xDiff = Math.abs(other.bbox.x - lineX);
+    
+    // 相邻行：y 差距在 2 倍行高内，x 对齐（差距 < 50px）
+    if (yDiff < lineH * 2.5 && xDiff < 50) {
+      adjacentLines++;
     }
   }
+  
+  // 如果几乎没有相邻行，可能是图内文字
+  if (adjacentLines < 2 && widthRatio < 0.3) {
+    return true;
+  }
+  
   return false;
 }
 
-function extractFigureCaptionsFromOcr(ocrResult) {
-  const captions = [];
+/**
+ * 判断一行是否是真正的图标题（而非段落内引用）
+ */
+function isActualFigureCaption(line, allLines, pageWidth) {
+  const text = (line.text || "").trim();
   
-  // 从行级别结果中查找图标题
-  for (const line of ocrResult.lines || []) {
-    if (isFigureCaption(line.text)) {
+  // 检查是否匹配标题模式
+  let matchesCaption = false;
+  for (const pattern of FIGURE_CAPTION_PATTERNS) {
+    if (pattern.test(text)) {
+      matchesCaption = true;
+      break;
+    }
+  }
+  
+  if (!matchesCaption) return false;
+  
+  // 检查是否是段落内引用
+  for (const pattern of FIGURE_REFERENCE_PATTERNS) {
+    if (pattern.test(text)) {
+      return false;  // 是引用，不是标题
+    }
+  }
+  
+  // 检查"图"是否在行首
+  const figureMatch = text.match(/^[图圖]|^fig/i);
+  if (!figureMatch) {
+    // "图"不在行首，可能是引用
+    // 进一步检查：如果行很长，"图"在中间，则是引用
+    const figurePos = text.search(/[图圖]|fig/i);
+    if (figurePos > 10) {
+      return false;  // "图"在中间，是引用
+    }
+  }
+  
+  // 检查上一行，判断是否是段落续行
+  const lineY = line.bbox.y;
+  const lineH = line.bbox.h;
+  
+  // 找到最近的上一行
+  let prevLine = null;
+  let minGap = Infinity;
+  for (const other of allLines) {
+    const otherBottom = other.bbox.y + other.bbox.h;
+    if (otherBottom < lineY) {
+      const gap = lineY - otherBottom;
+      if (gap < minGap) {
+        minGap = gap;
+        prevLine = other;
+      }
+    }
+  }
+  
+  if (prevLine) {
+    const prevWidth = prevLine.bbox.w;
+    const prevWidthRatio = prevWidth / pageWidth;
+    
+    // 如果上一行是满行段落（宽度 > 80%），且间距很小
+    // 则当前行可能是段落续行
+    if (prevWidthRatio > 0.8 && minGap < lineH * 1.5) {
+      // 上一行是满行，间距小，当前行可能是续行
+      // 但如果当前行以"图"开头且后面是描述，仍然可能是标题
+      // 检查当前行长度：如果很长（> 50% 页宽），可能是标题行
+      if (line.bbox.w / pageWidth < 0.4) {
+        // 当前行很短，可能是引用在段落末尾
+        return false;
+      }
+    }
+    
+    // 如果上一行是短行（段末），当前行更可能是标题
+    if (prevWidthRatio < 0.7) {
+      return true;  // 上一行是段末，当前行是新内容（标题）
+    }
+    
+    // 如果间距很大（> 2 倍行高），说明中间有图片，当前行是标题
+    if (minGap > lineH * 2) {
+      return true;
+    }
+  }
+  
+  // 默认：如果匹配模式且不是引用，认为是标题
+  return true;
+}
+
+/**
+ * 从 OCR 结果中提取真正的图标题
+ */
+function extractFigureCaptionsFromOcr(ocrResult, pageWidth) {
+  const captions = [];
+  const lines = ocrResult.lines || [];
+  
+  for (const line of lines) {
+    // 跳过图内文字
+    if (isFigureInternalText(line, pageWidth, lines)) {
+      continue;
+    }
+    
+    // 检查是否是真正的图标题
+    if (isActualFigureCaption(line, lines, pageWidth)) {
       captions.push({
         text: line.text.trim(),
         bbox: line.bbox,
@@ -619,17 +755,25 @@ function extractFigureCaptionsFromOcr(ocrResult) {
   return captions;
 }
 
-// LLM 分析图标题的提示词
+/**
+ * 过滤出"段落文字"，排除图内文字
+ */
+function filterParagraphLines(ocrLines, pageWidth) {
+  return ocrLines.filter(line => !isFigureInternalText(line, pageWidth, ocrLines));
+}
+
+// LLM 分析图标题的提示词（改进版：区分标题和引用）
 function buildCaptionAnalysisPrompt(ocrLines) {
   const linesJson = ocrLines.map((l, i) => ({
     index: i,
     text: l.text,
     y: l.bbox.y,
     x: l.bbox.x,
+    w: l.bbox.w,
   }));
   
   return `你是图片标题识别专家。以下是 OCR 提取的文本行列表（含坐标）。
-请找出所有的图片标题（如"图 1.1 xxx"、"Figure 2.3 xxx"等）。
+请找出所有的**图片标题**（如"图 1.1 xxx"、"Figure 2.3 xxx"等）。
 
 OCR 文本行：
 ${JSON.stringify(linesJson, null, 2)}
@@ -646,10 +790,26 @@ ${JSON.stringify(linesJson, null, 2)}
   ]
 }
 
-注意：
-- 只识别图片标题，不要识别表格标题（表 X.X / Table X）
-- 标题通常以"图"、"圖"、"Figure"、"Fig."开头
-- 如果没有找到图标题，返回空数组`;
+**重要：区分"图片标题"和"段落中的图片引用"**
+
+✅ 图片标题特征：
+- 以"图"、"圖"、"Figure"、"Fig."开头
+- 通常是独立的一行或一行的开始部分
+- 后面跟着对图片内容的描述
+- 例如："图 2.1 正态分布的概率密度函数"
+
+❌ 不是图片标题（是段落中的引用）：
+- "如图 2.1 所示..."
+- "见图 2.1，我们可以发现..."
+- "由图 2.1 可知..."
+- "在图 2.1 中..."
+- "as shown in Figure 2.1..."
+这些是在正文段落中引用图片，不是标题！
+
+**其他注意事项**：
+- 不要识别表格标题（表 X.X / Table X）
+- 如果没有找到图标题，返回空数组
+- 短文字（如"x", "y", "O"）可能是图内标注，不是标题`;
 }
 
 async function analyzeCaptionsWithLlm(ocrLines, llmCfg, maxRetries) {
@@ -709,11 +869,15 @@ function canvasToGrayscale(canvas) {
 
 /**
  * 找到图标题上方、与图片有间距的"上一行文字"
- * 算法：从标题向上找，当间距 > 2倍行高时，认为中间是图片
- * @param {Array} ocrLines - OCR 识别的所有文字行
+ * 算法改进版：
+ * 1. 从标题向上找，当间距 > 2倍行高时，认为中间是图片
+ * 2. 如果上方没有文字或只有少量文字在页面很上方，说明图片在页面顶部
+ * 3. 检查是否是段落续行（避免误判段内引用）
+ * 
+ * @param {Array} ocrLines - OCR 识别的所有文字行（应该是已过滤的段落文字）
  * @param {Object} captionBbox - 图标题的 bbox
  * @param {number} pageHeight - 页面高度
- * @returns {Object|null} 上方文字行的 bbox，或 null
+ * @returns {Object} { bbox, isPageTop, gap, figureTop }
  */
 function findPreviousTextLine(ocrLines, captionBbox, pageHeight) {
   // 筛选在标题上方的文字行（行底部 y+h 在标题顶部 y 之上）
@@ -722,9 +886,18 @@ function findPreviousTextLine(ocrLines, captionBbox, pageHeight) {
     return lineBottom < captionBbox.y;
   });
   
+  // 估算页边距（通常页边距在 5-10% 页高）
+  const topMargin = pageHeight * 0.05;
+  
   if (linesAbove.length === 0) {
-    // 没有上方文字，返回页面顶部作为参考
-    return { bbox: { x: 0, y: 0, w: captionBbox.w, h: 0 }, isPageTop: true };
+    // 没有上方文字，图片在页面顶部
+    // 图片顶部 = 页边距
+    return { 
+      bbox: { x: 0, y: 0, w: captionBbox.w, h: 0 }, 
+      isPageTop: true, 
+      gap: captionBbox.y,
+      figureTop: topMargin  // 从页边距开始
+    };
   }
   
   // 按 y 坐标降序排列（从下往上，即从最接近标题的开始）
@@ -749,14 +922,32 @@ function findPreviousTextLine(ocrLines, captionBbox, pageHeight) {
     
     if (gap > significantGap) {
       // 这行文字和标题之间有足够的空间，应该是图片所在区域
-      return { bbox: line.bbox, isPageTop: false, gap };
+      // 图片顶部 = 该行文字底部 + 小间距
+      const figureTop = lineBottom + Math.min(avgLineHeight * 0.3, 10);
+      return { bbox: line.bbox, isPageTop: false, gap, figureTop };
     }
   }
   
-  // 如果没找到有显著间距的行，返回最上方的文字行
-  // 这种情况可能是：图片很小，或者排版紧凑
+  // 特殊情况：如果最上方的文字行距离页面顶部有很大空白
+  // 说明图片可能在页面最上方（文字行是在图片下方的其他内容）
   const topMostLine = linesAbove[linesAbove.length - 1];
-  return { bbox: topMostLine.bbox, isPageTop: false, gap: 0 };
+  const gapFromPageTop = topMostLine.bbox.y - topMargin;
+  
+  if (gapFromPageTop > captionBbox.y - (topMostLine.bbox.y + topMostLine.bbox.h)) {
+    // 页面顶部空白 > 标题上方空白，图片可能在页面顶部
+    // 这种情况下返回页面顶部
+    return { 
+      bbox: { x: 0, y: topMargin, w: captionBbox.w, h: 0 }, 
+      isPageTop: true, 
+      gap: captionBbox.y - topMargin,
+      figureTop: topMargin
+    };
+  }
+  
+  // 默认情况：返回最上方的文字行，图片在其下方
+  // 这种情况可能是：图片很小，或者排版紧凑
+  const figureTop = topMostLine.bbox.y + topMostLine.bbox.h + Math.min(avgLineHeight * 0.3, 10);
+  return { bbox: topMostLine.bbox, isPageTop: false, gap: 0, figureTop };
 }
 
 /**
@@ -840,8 +1031,8 @@ function findHorizontalBoundsByDensity(grayData, top, bottom, hintLeft, hintRigh
 }
 
 /**
- * 主要的图片边界检测函数（文字夹逼法）
- * @param {Array} ocrLines - OCR 识别的所有文字行
+ * 主要的图片边界检测函数（文字夹逼法 改进版）
+ * @param {Array} ocrLines - OCR 识别的所有文字行（已过滤段落文字）
  * @param {Object} captionBbox - 图标题的 bbox {x, y, w, h}
  * @param {Object} grayData - 灰度图像数据
  * @param {number} pageWidth - 页面宽度
@@ -859,15 +1050,9 @@ function detectFigureBboxByTextSandwich(ocrLines, captionBbox, grayData, pageWid
   }
   
   // 第二步：确定垂直边界
-  let figureTop, figureBottom;
-  
-  if (prevTextResult.isPageTop) {
-    // 图片在页面顶部
-    figureTop = padding;
-  } else {
-    // 图片顶部 = 上方文字底部 + padding
-    figureTop = prevTextResult.bbox.y + prevTextResult.bbox.h + padding;
-  }
+  // 使用改进后的 figureTop（已考虑页边距和行间距）
+  let figureTop = prevTextResult.figureTop ?? padding;
+  let figureBottom;
   
   // 图片底部 = 标题顶部 - padding
   figureBottom = captionBbox.y - padding;
@@ -970,16 +1155,20 @@ async function detectFigureBboxes(canvas, pageNum) {
     return detectedFigures;
   }
   
-  // 2. 用正则直接识别图标题
-  let captions = extractFigureCaptionsFromOcr(ocrResult);
+  // 2. 过滤出段落文字（排除图内孤立文字）
+  const paragraphLines = filterParagraphLines(ocrResult.lines, width);
+  log(`页 ${pageNum}: 过滤后段落文字 ${paragraphLines.length} 行`);
+  
+  // 3. 用改进的正则+上下文分析识别图标题
+  let captions = extractFigureCaptionsFromOcr(ocrResult, width);
   log(`页 ${pageNum}: 正则识别到 ${captions.length} 个图标题`);
   
-  // 3. 如果正则没找到，尝试用 LLM 分析
-  if (captions.length === 0 && ocrResult.lines.length > 0) {
+  // 4. 如果正则没找到，尝试用 LLM 分析
+  if (captions.length === 0 && paragraphLines.length > 0) {
     log(`页 ${pageNum}: 尝试 LLM 分析图标题...`);
     const llmCfg = getRoleConfig("transcriber");
     const { maxRetries } = getRunSettings();
-    captions = await analyzeCaptionsWithLlm(ocrResult.lines, llmCfg, maxRetries);
+    captions = await analyzeCaptionsWithLlm(paragraphLines, llmCfg, maxRetries);
     log(`页 ${pageNum}: LLM 识别到 ${captions.length} 个图标题`);
   }
   
@@ -988,10 +1177,10 @@ async function detectFigureBboxes(canvas, pageNum) {
     return detectedFigures;
   }
   
-  // 4. 准备灰度图像用于水平边界检测
+  // 5. 准备灰度图像用于水平边界检测
   const grayData = canvasToGrayscale(canvas);
   
-  // 5. 对每个图标题，使用"文字夹逼法"检测图片区域
+  // 6. 对每个图标题，使用"文字夹逼法"检测图片区域
   // 按 y 坐标排序（从上到下），方便处理多图情况
   captions.sort((a, b) => a.bbox.y - b.bbox.y);
   
@@ -1001,9 +1190,10 @@ async function detectFigureBboxes(canvas, pageNum) {
     
     log(`页 ${pageNum}: 处理图标题 "${caption.text.slice(0, 30)}..." (y=${caption.bbox.y})`);
     
-    // 过滤掉在当前标题下方的其他标题行（避免干扰上一文字行的查找）
-    // 对于当前图，只考虑在其标题上方的文字行
-    const relevantOcrLines = ocrResult.lines.filter(line => {
+    // 过滤：
+    // a) 排除所有图标题行
+    // b) 只使用段落文字（已排除图内孤立文字）
+    const relevantOcrLines = paragraphLines.filter(line => {
       // 排除所有图标题行
       const isCaption = captions.some(cap => 
         Math.abs(cap.bbox.y - line.bbox.y) < 5 && 
@@ -1012,7 +1202,7 @@ async function detectFigureBboxes(canvas, pageNum) {
       return !isCaption;
     });
     
-    // 使用"文字夹逼法"检测 bbox
+    // 使用"文字夹逼法"检测 bbox（传入过滤后的段落文字）
     let bbox = detectFigureBboxByTextSandwich(
       relevantOcrLines,
       caption.bbox,
@@ -2339,6 +2529,26 @@ const LATEX_REPAIR_RULES = {
         }
         return match;
       },
+    },
+    {
+      name: "command_before_chinese",
+      desc: "LaTeX 命令后直接跟中文需要加空格",
+      // 匹配常见的间距/格式命令后直接跟中文字符（没有空格或花括号）
+      // 中文字符范围：\u4e00-\u9fff
+      pattern: /(\\(?:quad|qquad|hspace\{[^}]*\}|vspace\{[^}]*\}|hfill|vfill|noindent|indent|par|newline|linebreak|pagebreak|smallskip|medskip|bigskip|kern[^a-zA-Z]|hskip[^a-zA-Z]))(?=[\u4e00-\u9fff])/g,
+      fix: (match) => `${match} `,
+    },
+    {
+      name: "text_command_before_chinese",
+      desc: "\\text 类命令后直接跟中文需要加空格",
+      pattern: /(\\(?:text|textbf|textit|textrm|textsf|texttt|textsc|emph)\{[^}]*\})(?=[\u4e00-\u9fff])/g,
+      fix: (match) => `${match} `,
+    },
+    {
+      name: "dotfill_before_chinese",
+      desc: "\\dotfill 后跟中文需要加空格",
+      pattern: /(\\dotfill)(?=[\u4e00-\u9fff])/g,
+      fix: (match) => `${match} `,
     },
   ],
 
