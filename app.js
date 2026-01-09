@@ -690,7 +690,7 @@ async function analyzeCaptionsWithLlm(ocrLines, llmCfg, maxRetries) {
 }
 
 // ---------------------------
-// Image Processing: Edge Detection
+// Image Processing: 改进的"文字夹逼法"图片检测
 // ---------------------------
 
 function canvasToGrayscale(canvas) {
@@ -707,11 +707,217 @@ function canvasToGrayscale(canvas) {
   return { gray, width: canvas.width, height: canvas.height };
 }
 
+/**
+ * 找到图标题上方、与图片有间距的"上一行文字"
+ * 算法：从标题向上找，当间距 > 2倍行高时，认为中间是图片
+ * @param {Array} ocrLines - OCR 识别的所有文字行
+ * @param {Object} captionBbox - 图标题的 bbox
+ * @param {number} pageHeight - 页面高度
+ * @returns {Object|null} 上方文字行的 bbox，或 null
+ */
+function findPreviousTextLine(ocrLines, captionBbox, pageHeight) {
+  // 筛选在标题上方的文字行（行底部 y+h 在标题顶部 y 之上）
+  const linesAbove = ocrLines.filter(line => {
+    const lineBottom = line.bbox.y + line.bbox.h;
+    return lineBottom < captionBbox.y;
+  });
+  
+  if (linesAbove.length === 0) {
+    // 没有上方文字，返回页面顶部作为参考
+    return { bbox: { x: 0, y: 0, w: captionBbox.w, h: 0 }, isPageTop: true };
+  }
+  
+  // 按 y 坐标降序排列（从下往上，即从最接近标题的开始）
+  linesAbove.sort((a, b) => (b.bbox.y + b.bbox.h) - (a.bbox.y + a.bbox.h));
+  
+  // 计算平均行高（用于判断"显著间距"）
+  let totalHeight = 0;
+  for (const line of linesAbove) {
+    totalHeight += line.bbox.h;
+  }
+  const avgLineHeight = totalHeight / linesAbove.length;
+  
+  // 从最接近标题的行开始，找到有"显著间距"的行
+  // 显著间距 = 间距 > 2倍平均行高（说明中间有图片）
+  for (let i = 0; i < linesAbove.length; i++) {
+    const line = linesAbove[i];
+    const lineBottom = line.bbox.y + line.bbox.h;
+    const gap = captionBbox.y - lineBottom;
+    
+    // 判断条件：间距大于 2 倍行高，或大于 50 像素（处理行高计算不准的情况）
+    const significantGap = Math.max(avgLineHeight * 2, 50);
+    
+    if (gap > significantGap) {
+      // 这行文字和标题之间有足够的空间，应该是图片所在区域
+      return { bbox: line.bbox, isPageTop: false, gap };
+    }
+  }
+  
+  // 如果没找到有显著间距的行，返回最上方的文字行
+  // 这种情况可能是：图片很小，或者排版紧凑
+  const topMostLine = linesAbove[linesAbove.length - 1];
+  return { bbox: topMostLine.bbox, isPageTop: false, gap: 0 };
+}
+
+/**
+ * 使用列密度扫描确定水平边界
+ * @param {Object} grayData - 灰度图像数据
+ * @param {number} top - 搜索区域顶部
+ * @param {number} bottom - 搜索区域底部
+ * @param {number} hintLeft - 参考左边界（标题 x）
+ * @param {number} hintRight - 参考右边界（标题 x + w）
+ * @returns {Object} { left, right }
+ */
+function findHorizontalBoundsByDensity(grayData, top, bottom, hintLeft, hintRight) {
+  const { gray, width, height } = grayData;
+  const whiteThreshold = 240;
+  const densityThreshold = 0.03; // 列密度阈值
+  
+  // 扩展搜索范围（标题可能比图片窄）
+  const searchMargin = Math.max(100, (hintRight - hintLeft) * 0.5);
+  const searchLeft = Math.max(0, hintLeft - searchMargin);
+  const searchRight = Math.min(width, hintRight + searchMargin);
+  
+  const rowCount = Math.max(1, bottom - top);
+  
+  // 计算每列的像素密度
+  const columnDensity = [];
+  for (let x = searchLeft; x < searchRight; x++) {
+    let nonWhiteCount = 0;
+    for (let y = top; y < bottom; y++) {
+      if (gray[y * width + x] < whiteThreshold) {
+        nonWhiteCount++;
+      }
+    }
+    columnDensity.push({
+      x,
+      density: nonWhiteCount / rowCount,
+    });
+  }
+  
+  // 使用滑动窗口平滑（减少噪点影响）
+  const windowSize = 5;
+  const smoothedDensity = [];
+  for (let i = 0; i < columnDensity.length; i++) {
+    let sum = 0;
+    let count = 0;
+    for (let j = Math.max(0, i - windowSize); j <= Math.min(columnDensity.length - 1, i + windowSize); j++) {
+      sum += columnDensity[j].density;
+      count++;
+    }
+    smoothedDensity.push({
+      x: columnDensity[i].x,
+      density: sum / count,
+    });
+  }
+  
+  // 找左边界：从左向右，第一个密度超过阈值的位置
+  let left = hintLeft;
+  for (let i = 0; i < smoothedDensity.length; i++) {
+    if (smoothedDensity[i].density > densityThreshold) {
+      left = smoothedDensity[i].x;
+      break;
+    }
+  }
+  
+  // 找右边界：从右向左，第一个密度超过阈值的位置
+  let right = hintRight;
+  for (let i = smoothedDensity.length - 1; i >= 0; i--) {
+    if (smoothedDensity[i].density > densityThreshold) {
+      right = smoothedDensity[i].x;
+      break;
+    }
+  }
+  
+  // 确保 right > left
+  if (right <= left) {
+    // 回退到参考值
+    left = hintLeft;
+    right = hintRight;
+  }
+  
+  return { left, right };
+}
+
+/**
+ * 主要的图片边界检测函数（文字夹逼法）
+ * @param {Array} ocrLines - OCR 识别的所有文字行
+ * @param {Object} captionBbox - 图标题的 bbox {x, y, w, h}
+ * @param {Object} grayData - 灰度图像数据
+ * @param {number} pageWidth - 页面宽度
+ * @param {number} pageHeight - 页面高度
+ * @returns {Object|null} 图片的 bbox {x, y, w, h}
+ */
+function detectFigureBboxByTextSandwich(ocrLines, captionBbox, grayData, pageWidth, pageHeight) {
+  const padding = 8; // 边界内缩像素
+  
+  // 第一步：找到上方的文字行
+  const prevTextResult = findPreviousTextLine(ocrLines, captionBbox, pageHeight);
+  
+  if (!prevTextResult) {
+    return null;
+  }
+  
+  // 第二步：确定垂直边界
+  let figureTop, figureBottom;
+  
+  if (prevTextResult.isPageTop) {
+    // 图片在页面顶部
+    figureTop = padding;
+  } else {
+    // 图片顶部 = 上方文字底部 + padding
+    figureTop = prevTextResult.bbox.y + prevTextResult.bbox.h + padding;
+  }
+  
+  // 图片底部 = 标题顶部 - padding
+  figureBottom = captionBbox.y - padding;
+  
+  // 验证垂直范围有效
+  const figureHeight = figureBottom - figureTop;
+  if (figureHeight < 30) {
+    // 高度太小，可能识别错误
+    return null;
+  }
+  
+  // 第三步：确定水平边界
+  const hintLeft = captionBbox.x;
+  const hintRight = captionBbox.x + captionBbox.w;
+  
+  const { left, right } = findHorizontalBoundsByDensity(
+    grayData,
+    figureTop,
+    figureBottom,
+    hintLeft,
+    hintRight
+  );
+  
+  // 构建最终 bbox
+  const bbox = {
+    x: Math.max(0, left - padding),
+    y: Math.max(0, figureTop),
+    w: Math.min(pageWidth, right - left + padding * 2),
+    h: figureHeight,
+  };
+  
+  // 验证 bbox 合理性
+  if (bbox.w < 30 || bbox.h < 30) {
+    return null;
+  }
+  
+  // 宽高比检查（排除极端情况）
+  const aspectRatio = bbox.w / bbox.h;
+  if (aspectRatio > 10 || aspectRatio < 0.1) {
+    return null;
+  }
+  
+  return bbox;
+}
+
+// 保留旧的边缘检测作为备用（某些情况可能仍有用）
 function sobelEdgeDetection(grayData, threshold) {
   const { gray, width, height } = grayData;
   const edges = new Uint8Array(width * height);
   
-  // Sobel 算子
   const sobelX = [-1, 0, 1, -2, 0, 2, -1, 0, 1];
   const sobelY = [-1, -2, -1, 0, 0, 0, 1, 2, 1];
   
@@ -736,201 +942,15 @@ function sobelEdgeDetection(grayData, threshold) {
   return edges;
 }
 
-function findRectanglesAboveCaption(edges, width, height, captionBbox, minWidth, minHeight) {
-  // 在标题上方搜索矩形区域
-  const searchTop = 0;
-  const searchBottom = captionBbox.y - 5; // 标题上方留一点间距
-  const searchLeft = Math.max(0, captionBbox.x - 50);
-  const searchRight = Math.min(width, captionBbox.x + captionBbox.w + 50);
-  
-  if (searchBottom <= searchTop) return null;
-  
-  // 从标题位置向上扫描，寻找水平边缘线
-  const horizontalLines = [];
-  
-  for (let y = searchBottom; y >= searchTop; y--) {
-    let lineStart = -1;
-    let lineLength = 0;
-    
-    for (let x = searchLeft; x < searchRight; x++) {
-      if (edges[y * width + x] > 0) {
-        if (lineStart < 0) lineStart = x;
-        lineLength++;
-      } else {
-        if (lineLength > minWidth * 0.5) {
-          horizontalLines.push({ y, x1: lineStart, x2: lineStart + lineLength });
-        }
-        lineStart = -1;
-        lineLength = 0;
-      }
-    }
-    if (lineLength > minWidth * 0.5) {
-      horizontalLines.push({ y, x1: lineStart, x2: lineStart + lineLength });
-    }
-  }
-  
-  // 尝试找到构成矩形的边
-  // 简化策略：找到最接近标题的底边，然后向上找顶边
-  if (horizontalLines.length < 2) return null;
-  
-  // 按 y 坐标排序（从下到上）
-  horizontalLines.sort((a, b) => b.y - a.y);
-  
-  // 底边：最接近标题的水平线
-  const bottomLine = horizontalLines[0];
-  
-  // 顶边：在底边上方，长度相近的水平线
-  let topLine = null;
-  for (let i = 1; i < horizontalLines.length; i++) {
-    const line = horizontalLines[i];
-    const lengthDiff = Math.abs((line.x2 - line.x1) - (bottomLine.x2 - bottomLine.x1));
-    const heightDiff = bottomLine.y - line.y;
-    
-    if (heightDiff >= minHeight && lengthDiff < minWidth * 0.3) {
-      topLine = line;
-      break;
-    }
-  }
-  
-  if (!topLine) return null;
-  
-  // 构建矩形
-  const rect = {
-    x: Math.min(bottomLine.x1, topLine.x1),
-    y: topLine.y,
-    w: Math.max(bottomLine.x2, topLine.x2) - Math.min(bottomLine.x1, topLine.x1),
-    h: bottomLine.y - topLine.y,
-  };
-  
-  // 验证矩形合理性
-  if (rect.w < minWidth || rect.h < minHeight) return null;
-  if (rect.w / rect.h > 5 || rect.h / rect.w > 5) return null; // 宽高比过极端
-  
-  return rect;
-}
-
-// ---------------------------
-// Image Processing: Whitespace Detection
-// ---------------------------
-
-function detectWhitespaceBoundary(grayData, captionBbox, minHeight) {
-  const { gray, width, height } = grayData;
-  
-  // 从标题位置向上扫描
-  const searchTop = 0;
-  const searchBottom = captionBbox.y - 5;
-  const searchLeft = Math.max(0, captionBbox.x - 30);
-  const searchRight = Math.min(width, captionBbox.x + captionBbox.w + 30);
-  
-  if (searchBottom <= searchTop) return null;
-  
-  // 计算每行的像素密度（非白色像素占比）
-  const rowDensity = [];
-  const whiteThreshold = 240; // 接近白色的阈值
-  
-  for (let y = searchBottom; y >= searchTop; y--) {
-    let nonWhiteCount = 0;
-    for (let x = searchLeft; x < searchRight; x++) {
-      if (gray[y * width + x] < whiteThreshold) {
-        nonWhiteCount++;
-      }
-    }
-    rowDensity.push({
-      y,
-      density: nonWhiteCount / (searchRight - searchLeft),
-    });
-  }
-  
-  // 寻找密度变化的边界
-  // 策略：从标题向上，找到第一个"低密度区"后的"高密度区"结束点
-  
-  const lowDensityThreshold = 0.02; // 空白行阈值
-  const highDensityThreshold = 0.1; // 内容行阈值
-  
-  let inFigure = false;
-  let figureTop = -1;
-  let figureBottom = searchBottom;
-  let consecutiveLowDensity = 0;
-  
-  for (let i = 0; i < rowDensity.length; i++) {
-    const { y, density } = rowDensity[i];
-    
-    if (!inFigure) {
-      // 还没进入图片区域
-      if (density > highDensityThreshold) {
-        inFigure = true;
-        figureBottom = y;
-      }
-    } else {
-      // 已在图片区域内
-      if (density < lowDensityThreshold) {
-        consecutiveLowDensity++;
-        if (consecutiveLowDensity > 5) {
-          // 连续多行空白，认为图片结束
-          figureTop = y + consecutiveLowDensity;
-          break;
-        }
-      } else {
-        consecutiveLowDensity = 0;
-        figureTop = y;
-      }
-    }
-  }
-  
-  if (figureTop < 0 || figureBottom - figureTop < minHeight) {
-    return null;
-  }
-  
-  // 左右边界：扫描列密度
-  let figureLeft = searchLeft;
-  let figureRight = searchRight;
-  
-  // 左边界
-  for (let x = searchLeft; x < searchRight; x++) {
-    let colDensity = 0;
-    for (let y = figureTop; y <= figureBottom; y++) {
-      if (gray[y * width + x] < whiteThreshold) colDensity++;
-    }
-    if (colDensity / (figureBottom - figureTop) > lowDensityThreshold) {
-      figureLeft = x;
-      break;
-    }
-  }
-  
-  // 右边界
-  for (let x = searchRight - 1; x >= searchLeft; x--) {
-    let colDensity = 0;
-    for (let y = figureTop; y <= figureBottom; y++) {
-      if (gray[y * width + x] < whiteThreshold) colDensity++;
-    }
-    if (colDensity / (figureBottom - figureTop) > lowDensityThreshold) {
-      figureRight = x;
-      break;
-    }
-  }
-  
-  return {
-    x: figureLeft,
-    y: figureTop,
-    w: figureRight - figureLeft,
-    h: figureBottom - figureTop,
-  };
-}
-
 // ---------------------------
 // Combined Figure Detection
 // ---------------------------
 
 async function detectFigureBboxes(canvas, pageNum) {
   const useOcr = document.getElementById("useOcrDetection")?.checked ?? true;
-  const useEdge = document.getElementById("useEdgeDetection")?.checked ?? true;
-  const useWhitespace = document.getElementById("useWhitespaceDetection")?.checked ?? true;
-  const edgeThreshold = Number(document.getElementById("edgeThreshold")?.value || 50);
   
   const width = canvas.width;
   const height = canvas.height;
-  const minFigWidth = width * 0.1;
-  const minFigHeight = height * 0.05;
   
   const detectedFigures = [];
   
@@ -968,39 +988,42 @@ async function detectFigureBboxes(canvas, pageNum) {
     return detectedFigures;
   }
   
-  // 4. 图像处理：检测图片边界
+  // 4. 准备灰度图像用于水平边界检测
   const grayData = canvasToGrayscale(canvas);
-  let edges = null;
-  if (useEdge) {
-    edges = sobelEdgeDetection(grayData, edgeThreshold);
-  }
   
-  // 5. 对每个图标题，检测其上方的图片区域
+  // 5. 对每个图标题，使用"文字夹逼法"检测图片区域
+  // 按 y 坐标排序（从上到下），方便处理多图情况
+  captions.sort((a, b) => a.bbox.y - b.bbox.y);
+  
   for (let i = 0; i < captions.length; i++) {
     const caption = captions[i];
     const figureId = caption.figureId || `p${pageNum}_fig${i + 1}`;
     
     log(`页 ${pageNum}: 处理图标题 "${caption.text.slice(0, 30)}..." (y=${caption.bbox.y})`);
     
-    let bbox = null;
+    // 过滤掉在当前标题下方的其他标题行（避免干扰上一文字行的查找）
+    // 对于当前图，只考虑在其标题上方的文字行
+    const relevantOcrLines = ocrResult.lines.filter(line => {
+      // 排除所有图标题行
+      const isCaption = captions.some(cap => 
+        Math.abs(cap.bbox.y - line.bbox.y) < 5 && 
+        cap.text.includes(line.text.slice(0, 10))
+      );
+      return !isCaption;
+    });
     
-    // 策略 A：黑框检测
-    if (useEdge && edges) {
-      bbox = findRectanglesAboveCaption(edges, width, height, caption.bbox, minFigWidth, minFigHeight);
-      if (bbox) {
-        log(`页 ${pageNum}: 黑框检测成功 - ${figureId}`);
-      }
-    }
-    
-    // 策略 B：空白边界检测（回退）
-    if (!bbox && useWhitespace) {
-      bbox = detectWhitespaceBoundary(grayData, caption.bbox, minFigHeight);
-      if (bbox) {
-        log(`页 ${pageNum}: 空白边界检测成功 - ${figureId}`);
-      }
-    }
+    // 使用"文字夹逼法"检测 bbox
+    let bbox = detectFigureBboxByTextSandwich(
+      relevantOcrLines,
+      caption.bbox,
+      grayData,
+      width,
+      height
+    );
     
     if (bbox) {
+      log(`页 ${pageNum}: 文字夹逼法检测成功 - ${figureId} (${bbox.x},${bbox.y},${bbox.w},${bbox.h})`);
+      
       // 验证 bbox 合理性
       bbox = normalizeBbox(bbox, width, height);
       if (bbox) {
@@ -1009,11 +1032,11 @@ async function detectFigureBboxes(canvas, pageNum) {
           bbox,
           caption: caption.text,
           captionBbox: caption.bbox,
-          method: edges ? "edge" : "whitespace",
+          method: "text_sandwich",
         });
       }
     } else {
-      log(`页 ${pageNum}: 无法检测图片边界 - ${figureId}，将使用 LLM 估计`);
+      log(`页 ${pageNum}: 文字夹逼法检测失败 - ${figureId}，将使用 LLM 估计`);
     }
   }
   
