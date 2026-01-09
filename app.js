@@ -1917,22 +1917,49 @@ function collectHeadingsInOrder() {
 }
 
 function buildLatexPreamble(template) {
+  // 通用的定理环境定义
+  const theoremDefs = `
+% 定理环境定义
+\\theoremstyle{definition}
+\\newtheorem{definition}{定义}[section]
+\\newtheorem{example}{例}[section]
+\\newtheorem{exercise}{习题}[section]
+\\theoremstyle{plain}
+\\newtheorem{theorem}{定理}[section]
+\\newtheorem{lemma}{引理}[section]
+\\newtheorem{corollary}{推论}[section]
+\\newtheorem{proposition}{命题}[section]
+\\theoremstyle{remark}
+\\newtheorem{remark}{注}[section]
+`;
+
   if (template === "article") {
+    // article 模板：使用 pdflatex，需要 inputenc 处理 UTF-8
+    // 注意：如果包含中文，建议切换到 ctexart
     return `\\documentclass{article}
 \\usepackage[utf8]{inputenc}
+\\usepackage[T1]{fontenc}
 \\usepackage{amsmath,amssymb,amsthm}
 \\usepackage{graphicx}
 \\usepackage{geometry}
+\\usepackage{hyperref}
 \\geometry{margin=1in}
+${theoremDefs}
 \\begin{document}
 `;
   }
-  // ctexart default
-  return `\\documentclass[UTF8]{ctexart}
+  
+  // ctexart 模板：必须使用 xelatex 或 lualatex 编译
+  // 编译命令: xelatex main.tex
+  return `% !TEX program = xelatex
+% 编译方式: xelatex main.tex （不要使用 pdflatex）
+\\documentclass[UTF8,a4paper]{ctexart}
 \\usepackage{amsmath,amssymb,amsthm}
 \\usepackage{graphicx}
 \\usepackage{geometry}
+\\usepackage{hyperref}
 \\geometry{margin=1in}
+${theoremDefs}
 \\begin{document}
 `;
 }
@@ -2526,38 +2553,122 @@ function checkEnvironmentBalance(latex) {
 }
 
 function addTheoremPreamble(latex, template) {
-  // 检查是否需要添加定理环境定义
-  const needsTheorem = /\\begin\{theorem\}/.test(latex);
-  const needsDefinition = /\\begin\{definition\}/.test(latex);
-  const needsExample = /\\begin\{example\}/.test(latex);
-  const needsProof = /\\begin\{proof\}/.test(latex);
+  // 定理环境现在已经在 buildLatexPreamble 中统一定义
+  // 这个函数保留用于向后兼容，但不再需要额外添加定义
+  return latex;
+}
 
-  if (!needsTheorem && !needsDefinition && !needsExample) {
-    return latex;
+/**
+ * 验证 LaTeX 文档的可编译性，返回问题列表
+ */
+function validateLatexCompilability(latex, imageList = []) {
+  const issues = [];
+  
+  // 1. 检查文档结构完整性
+  if (!latex.includes("\\documentclass")) {
+    issues.push({ severity: "error", message: "缺少 \\documentclass" });
   }
+  if (!latex.includes("\\begin{document}")) {
+    issues.push({ severity: "error", message: "缺少 \\begin{document}" });
+  }
+  if (!latex.includes("\\end{document}")) {
+    issues.push({ severity: "error", message: "缺少 \\end{document}" });
+  }
+  
+  // 2. 检查编译器兼容性
+  if (latex.includes("ctexart") || latex.includes("ctexbook")) {
+    if (!latex.includes("% !TEX program = xelatex") && !latex.includes("% !TEX program = lualatex")) {
+      issues.push({ 
+        severity: "warn", 
+        message: "使用 ctexart/ctexbook 需要用 xelatex 编译，不能用 pdflatex" 
+      });
+    }
+  }
+  
+  // 3. 检查环境配对
+  const envBalance = checkEnvironmentBalance(latex);
+  for (const issue of envBalance.issues) {
+    issues.push({ severity: "error", message: issue });
+  }
+  
+  // 4. 检查数学模式配对
+  const dollarCount = (latex.match(/(?<!\\)\$/g) || []).length;
+  if (dollarCount % 2 !== 0) {
+    issues.push({ severity: "error", message: "行内数学公式 $ 符号不配对" });
+  }
+  
+  // 5. 检查常见的 LaTeX 错误
+  if (/\\begin\{equation\}[\s\S]*?\\begin\{equation\}/.test(latex)) {
+    issues.push({ severity: "error", message: "equation 环境不能嵌套" });
+  }
+  if (/\\begin\{align\}[\s\S]*?\\begin\{align\}/.test(latex)) {
+    issues.push({ severity: "error", message: "align 环境不能嵌套" });
+  }
+  
+  // 6. 检查图片引用
+  const imageIds = new Set(imageList.map(img => img.id || img.filename?.replace(/\.png$/i, "")));
+  const includedImages = [];
+  latex.replace(/\\includegraphics(?:\[[^\]]*\])?\{([^}]+)\}/g, (match, filename) => {
+    const id = filename.replace(/\.png$/i, "").replace(/^.*\//, "");
+    includedImages.push(id);
+    return match;
+  });
+  
+  for (const id of includedImages) {
+    if (imageIds.size > 0 && !imageIds.has(id)) {
+      issues.push({ severity: "warn", message: `图片 ${id}.png 不在导出列表中` });
+    }
+  }
+  
+  // 7. 检查特殊字符（可能需要转义）
+  // 注意：% 在 LaTeX 中是注释，如果在正文中出现且不是注释开头，可能是问题
+  const lines = latex.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    // 检查行内是否有未转义的 % （排除行首注释）
+    if (/[^\\]%/.test(line) && !line.trim().startsWith("%")) {
+      // 可能是有意的注释，不报错，只警告
+    }
+    // 检查未转义的 & （在非表格/align环境中）
+    if (/[^\\]&/.test(line) && !/\\begin\{(tabular|array|align|matrix)/.test(latex.slice(0, latex.indexOf(line)))) {
+      // 可能在表格中，跳过
+    }
+  }
+  
+  return issues;
+}
 
-  const preambleAdditions = [];
-  if (needsTheorem || needsDefinition || needsExample) {
-    preambleAdditions.push("\\usepackage{amsthm}");
-  }
-  if (needsTheorem) {
-    preambleAdditions.push("\\newtheorem{theorem}{定理}[section]");
-  }
-  if (needsDefinition) {
-    preambleAdditions.push("\\newtheorem{definition}{定义}[section]");
-  }
-  if (needsExample) {
-    preambleAdditions.push("\\newtheorem{example}{例}[section]");
-  }
+/**
+ * 获取编译建议
+ */
+function getCompilationInstructions(template) {
+  if (template === "ctexart" || template === "ctexbook") {
+    return `
+编译说明：
+1. 本文档使用 ctexart 文档类，包含中文内容
+2. 必须使用 XeLaTeX 或 LuaLaTeX 编译，不能使用 pdfLaTeX
+3. 编译命令: xelatex main.tex
+4. 如果有引用，需要编译两次
 
-  if (preambleAdditions.length === 0) return latex;
+推荐工具：
+- TeXLive 或 MiKTeX（完整安装）
+- VSCode + LaTeX Workshop 插件
+- Overleaf（在线，需设置编译器为 XeLaTeX）
+`.trim();
+  }
+  
+  return `
+编译说明：
+1. 本文档使用 article 文档类
+2. 可以使用 pdfLaTeX、XeLaTeX 或 LuaLaTeX 编译
+3. 如果包含中文，建议切换到 ctexart 模板
+4. 编译命令: pdflatex main.tex 或 xelatex main.tex
 
-  // 在 \begin{document} 之前插入
-  const insertPoint = latex.indexOf("\\begin{document}");
-  if (insertPoint === -1) return latex;
-
-  const addition = preambleAdditions.join("\n") + "\n";
-  return latex.slice(0, insertPoint) + addition + latex.slice(insertPoint);
+推荐工具：
+- TeXLive 或 MiKTeX
+- VSCode + LaTeX Workshop 插件
+- Overleaf（在线）
+`.trim();
 }
 
 async function repairLatexWithLlm(latex, options = {}) {
@@ -2753,13 +2864,63 @@ async function exportZip() {
   if (!window.JSZip) throw new Error("JSZip missing.");
   if (!state.mainTex) throw new Error("No main.tex generated yet. Run organization first.");
 
-  setStage("Export: preparing ZIP");
+  setStage("Export: validating");
   setPageProgress("—", 0);
 
+  // 验证 LaTeX 可编译性
+  const imageList = flattenImagesList();
+  const validationIssues = validateLatexCompilability(state.mainTex, imageList);
+  
+  if (validationIssues.length > 0) {
+    log("LaTeX 验证发现以下问题：");
+    for (const issue of validationIssues) {
+      log(`  [${issue.severity}] ${issue.message}`);
+    }
+    const errorCount = validationIssues.filter(i => i.severity === "error").length;
+    if (errorCount > 0) {
+      log(`警告: 有 ${errorCount} 个错误，编译可能失败。建议先运行 LaTeX 修复。`);
+    }
+  } else {
+    log("LaTeX 验证通过，无明显问题。");
+  }
+
+  setStage("Export: preparing ZIP");
   const zip = new window.JSZip();
+  
+  // main.tex
   zip.file("main.tex", state.mainTex);
+  
+  // 编译说明 README
+  const template = $("latexTemplate").value;
+  const compilationInstructions = getCompilationInstructions(template);
+  const readmeContent = `# LaTeX 导出包
+
+## 文件说明
+
+- main.tex: 主 LaTeX 文档
+- *.png: 从 PDF 中裁剪的图片
+- pages/: 每页的原始转写数据 (JSON)
+- section_tree.json: 章节结构树
+- images.json: 图片资源清单
+
+## ${compilationInstructions}
+
+## 验证结果
+
+${validationIssues.length === 0 ? "✅ 无明显问题" : validationIssues.map(i => `- [${i.severity}] ${i.message}`).join("\n")}
+
+## 生成信息
+
+- 生成时间: ${nowIso()}
+- 源 PDF: ${state.pdfFile?.name || "unknown"}
+- 页数: ${state.pageResults.size}
+- 图片数: ${imageList.length}
+`;
+  zip.file("README.md", readmeContent);
+  
+  // 其他数据文件
   zip.file("section_tree.json", JSON.stringify(state.sectionTree || {}, null, 2));
-  zip.file("images.json", JSON.stringify(flattenImagesList(), null, 2));
+  zip.file("images.json", JSON.stringify(imageList, null, 2));
 
   const pagesFolder = zip.folder("pages");
   const pagesArr = Array.from(state.pageResults.values()).sort((a, b) => a.page - b.page);
@@ -2772,7 +2933,7 @@ async function exportZip() {
   const imgs = Array.from(state.images.values()).sort((a, b) => (a.page - b.page) || a.id.localeCompare(b.id));
   for (let i = 0; i < imgs.length; i++) {
     const img = imgs[i];
-    setPageProgress(`${i + 1} / ${imgs.length}`, imgs.length ? i / imgs.length : 1);
+    setPageProgress(`图片 ${i + 1} / ${imgs.length}`, imgs.length ? i / imgs.length : 1);
     zip.file(img.filename, img.blob);
   }
 
