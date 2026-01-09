@@ -17,6 +17,10 @@
         </div>
       </div>
       <div class="topbar__right">
+        <div class="segmented" role="group" aria-label="Config">
+          <button class="segmented__btn" id="exportConfigBtn" type="button" title="导出配置到文件">📤 导出配置</button>
+          <button class="segmented__btn" id="importConfigBtn" type="button" title="从文件导入配置">📥 导入配置</button>
+        </div>
         <div class="segmented" role="group" aria-label="Language">
           <button class="segmented__btn" id="langZhBtn" type="button">中文</button>
           <button class="segmented__btn" id="langEnBtn" type="button">EN</button>
@@ -336,15 +340,74 @@
           </div>
         </div>
 
+        <details class="details" style="margin-top:12px">
+          <summary class="details__summary" id="sumFigureDetection">图片检测设置（OCR + 迭代验证）</summary>
+          <div class="grid grid--2" style="margin-top:10px">
+            <div class="field">
+              <label class="toggle">
+                <input id="useOcrDetection" type="checkbox" checked />
+                <span class="toggle__label">启用 OCR 辅助定位</span>
+              </label>
+              <div class="field__hint">使用 Tesseract.js 提取文字坐标，精确定位图标题和图片边界</div>
+            </div>
+            <div class="field">
+              <label class="toggle">
+                <input id="useLlmValidation" type="checkbox" checked />
+                <span class="toggle__label">启用 LLM 迭代验证</span>
+              </label>
+              <div class="field__hint">让 LLM 验证裁剪结果是否完整，自动调整上边界（更准确但更慢）</div>
+            </div>
+          </div>
+          <div class="grid grid--3" style="margin-top:10px">
+            <div class="field">
+              <label class="field__label">OCR 语言</label>
+              <select class="field__input" id="ocrLanguage">
+                <option value="chi_sim+eng">中文简体 + 英文</option>
+                <option value="chi_tra+eng">中文繁体 + 英文</option>
+                <option value="eng">仅英文</option>
+                <option value="chi_sim">仅中文简体</option>
+              </select>
+            </div>
+            <div class="field">
+              <label class="field__label">OCR 状态</label>
+              <div class="pill" id="ocrStatus">未初始化</div>
+            </div>
+            <div class="field">
+              <label class="field__label">验证状态</label>
+              <div class="pill" id="validationStatus">就绪</div>
+            </div>
+          </div>
+          <div class="field" style="margin-top:10px">
+            <div class="field__hint" style="line-height:1.6">
+              <strong>迭代验证算法说明：</strong><br>
+              1. OCR 提取页面所有文字及精确坐标<br>
+              2. 识别图标题（"图 X.X" / "Figure X"），区分标题和段落引用<br>
+              3. 生成多个候选上边界（排除段落末行干扰）<br>
+              4. 对每个候选裁剪图片，LLM 验证是否完整<br>
+              5. 如果 LLM 认为不完整，自动尝试下一个候选（上边界上移）<br>
+              6. 直到找到完整裁剪，或从所有候选中选择最佳
+            </div>
+          </div>
+        </details>
+
         <div class="grid grid--2">
           <div class="field">
-            <label class="field__label" id="lblWorkRecord">工作记录（断点续作）</label>
+            <label class="field__label" id="lblWorkRecord">工作记录（断点续作 / 完整恢复）</label>
             <div class="inline">
               <input class="field__input" id="workRecordFile" type="file" accept=".zip,application/zip" />
               <button class="btn btn--ghost" id="importWorkRecordBtn" type="button">导入</button>
               <button class="btn btn--ghost" id="exportWorkRecordBtn" type="button">导出</button>
             </div>
-            <div class="field__hint" id="hintWorkRecord">导出/导入包含已完成页 JSON 与剪裁 PNG，用于继续未完成页。</div>
+            <div class="inline" style="margin-top:6px">
+              <label class="toggle">
+                <input id="importClearFirst" type="checkbox" checked />
+                <span class="toggle__label">导入前清空现有数据</span>
+              </label>
+            </div>
+            <div class="field__hint" id="hintWorkRecord">
+              导出/导入包含：每页 JSON、剪裁图片、窗口计划、章节树、main.tex。<br>
+              勾选"清空"可完整恢复工作状态；取消勾选则合并数据（断点续作）。
+            </div>
           </div>
           <div class="field">
             <label class="field__label" id="lblOrgConcurrency">滑动窗口并发数</label>
@@ -358,12 +421,50 @@
           <button class="btn btn--primary" id="transcribeBtn" type="button">1) 按页转写 + 剪裁出图</button>
           <button class="btn btn--primary" id="windowAssembleBtn" type="button">2) 滑动窗口初步组装（并发）</button>
           <button class="btn btn--primary" id="organizeBtn" type="button">3) 整体组装 + 生成 main.tex</button>
+          <button class="btn btn--primary" id="repairBtn" type="button">3.5) LaTeX 修复</button>
           <button class="btn btn--primary" id="exportBtn" type="button">4) 导出最终 ZIP</button>
           <button class="btn btn--ghost" id="stopBtn" type="button">停止</button>
           <button class="btn btn--ghost" id="continueBtn" type="button">继续</button>
           <button class="btn btn--ghost" id="earlyExportBtn" type="button">早停导出</button>
           <button class="btn" id="resetBtn" type="button">重置</button>
         </div>
+
+        <details class="details" style="margin-top:12px">
+          <summary class="details__summary" id="sumRepair">LaTeX 修复选项</summary>
+          <div class="grid grid--3" style="margin-top:10px">
+            <div class="field">
+              <label class="toggle">
+                <input id="repairTheoremsEnabled" type="checkbox" />
+                <span class="toggle__label" id="lblRepairTheorems">定理环境结构化</span>
+              </label>
+              <div class="field__hint" id="hintRepairTheorems">将 \textbf{定理/定义/例} 转换为 theorem/definition/example 环境</div>
+            </div>
+            <div class="field">
+              <label class="toggle">
+                <input id="repairUseLlm" type="checkbox" />
+                <span class="toggle__label" id="lblRepairUseLlm">LLM 深度修复</span>
+              </label>
+              <div class="field__hint" id="hintRepairUseLlm">对长文本分块调用 LLM 进行深度修复（较慢）</div>
+            </div>
+            <div class="field">
+              <div class="field__label" id="lblRepairStatus">修复状态</div>
+              <div class="pill" id="repairStatus">—</div>
+            </div>
+          </div>
+          <div class="field" style="margin-top:10px">
+            <div class="field__label">修复规则说明</div>
+            <div class="field__hint" style="line-height:1.6">
+              <strong>自动修复项：</strong><br>
+              1. 文档结构：\chapter 在 ctexart 中降级为 \section<br>
+              2. 目录混淆：目录页的章节命令降级为普通文本<br>
+              3. 数学错误：\phi→\varnothing、全角符号转半角、未闭合公式<br>
+              4. 环境闭合：equation/align/figure/table 环境自动补全<br>
+              5. 图表检查：检测引用的图片是否存在<br>
+              6. 编码问题：统一引号风格<br>
+              7. 定理结构化（可选）：\textbf{定理}→theorem 环境
+            </div>
+          </div>
+        </details>
 
         <div class="progress">
           <div class="progress__row">
@@ -437,6 +538,8 @@
 
     <!-- jszip -->
     <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+    <!-- tesseract.js for OCR -->
+    <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
     <script>
       // Minimal healthcheck: if the app module fails to load, show a visible hint.
       setTimeout(() => {

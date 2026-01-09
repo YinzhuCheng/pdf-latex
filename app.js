@@ -353,6 +353,7 @@ function setUiBusy(isBusy) {
     "transcribeBtn",
     "windowAssembleBtn",
     "organizeBtn",
+    "repairBtn",
     "exportBtn",
     "resetBtn",
     "renderPreviewBtn",
@@ -485,6 +486,1043 @@ async function previewOnePage() {
   out.getContext("2d").drawImage(canvas, 0, 0);
   setStage(`Preview: page ${start}`);
   log(`Preview rendered: page=${start}, ${canvas.width}x${canvas.height}`);
+}
+
+// ---------------------------
+// OCR (Tesseract.js)
+// ---------------------------
+
+let tesseractWorker = null;
+let tesseractReady = false;
+
+async function initTesseract() {
+  if (tesseractReady && tesseractWorker) return tesseractWorker;
+  
+  if (typeof Tesseract === "undefined") {
+    throw new Error("Tesseract.js 未加载。请检查网络连接。");
+  }
+
+  const statusEl = document.getElementById("ocrStatus");
+  if (statusEl) setPill(statusEl, "warn", "初始化中...");
+  
+  const lang = document.getElementById("ocrLanguage")?.value || "chi_sim+eng";
+  log(`初始化 Tesseract.js，语言: ${lang}`);
+  
+  try {
+    tesseractWorker = await Tesseract.createWorker(lang, 1, {
+      logger: (m) => {
+        if (m.status === "recognizing text") {
+          const pct = Math.round((m.progress || 0) * 100);
+          if (statusEl) setPill(statusEl, "warn", `识别中 ${pct}%`);
+        }
+      },
+    });
+    tesseractReady = true;
+    if (statusEl) setPill(statusEl, "ok", "就绪");
+    log("Tesseract.js 初始化完成");
+    return tesseractWorker;
+  } catch (e) {
+    if (statusEl) setPill(statusEl, "bad", "失败");
+    throw new Error(`Tesseract 初始化失败: ${e.message || e}`);
+  }
+}
+
+async function ocrExtractTextBlocks(canvas) {
+  const worker = await initTesseract();
+  const statusEl = document.getElementById("ocrStatus");
+  if (statusEl) setPill(statusEl, "warn", "识别中...");
+  
+  try {
+    const result = await worker.recognize(canvas);
+    if (statusEl) setPill(statusEl, "ok", "完成");
+    
+    // 提取所有文字块及其边界框
+    const blocks = [];
+    if (result.data && result.data.words) {
+      for (const word of result.data.words) {
+        blocks.push({
+          text: word.text,
+          confidence: word.confidence,
+          bbox: {
+            x: word.bbox.x0,
+            y: word.bbox.y0,
+            w: word.bbox.x1 - word.bbox.x0,
+            h: word.bbox.y1 - word.bbox.y0,
+          },
+        });
+      }
+    }
+    
+    // 也提取行级别的信息（更适合识别图标题）
+    const lines = [];
+    if (result.data && result.data.lines) {
+      for (const line of result.data.lines) {
+        lines.push({
+          text: line.text,
+          confidence: line.confidence,
+          bbox: {
+            x: line.bbox.x0,
+            y: line.bbox.y0,
+            w: line.bbox.x1 - line.bbox.x0,
+            h: line.bbox.y1 - line.bbox.y0,
+          },
+        });
+      }
+    }
+    
+    return { blocks, lines, fullText: result.data.text };
+  } catch (e) {
+    if (statusEl) setPill(statusEl, "bad", "失败");
+    throw e;
+  }
+}
+
+// ---------------------------
+// Figure Caption Detection (改进版)
+// ---------------------------
+
+// 图标题正则模式（中英文）
+const FIGURE_CAPTION_PATTERNS = [
+  // 中文模式 - 行首
+  /^图\s*[\(\（]?\s*[a-zA-Z0-9]+\s*[\)\）]?\s*(\d+(?:[.\-]\d+)*)?/i,
+  /^圖\s*[\(\（]?\s*[a-zA-Z0-9]+\s*[\)\）]?\s*(\d+(?:[.\-]\d+)*)?/i,
+  /^图\s*(\d+(?:[.\-]\d+)*)/i,
+  /^圖\s*(\d+(?:[.\-]\d+)*)/i,
+  // 英文模式
+  /^figure\s*(\d+(?:[.\-]\d+)*)/i,
+  /^fig\.\s*(\d+(?:[.\-]\d+)*)/i,
+  /^fig\s+(\d+(?:[.\-]\d+)*)/i,
+];
+
+// 段落内引用模式（不是标题）
+const FIGURE_REFERENCE_PATTERNS = [
+  /如图\s*[\(\（]?\s*[a-zA-Z0-9]+\s*[\)\）]?\s*所示/,
+  /见图\s*[\(\（]?\s*[a-zA-Z0-9]+\s*[\)\）]?/,
+  /由图\s*[\(\（]?\s*[a-zA-Z0-9]+\s*[\)\）]?/,
+  /在图\s*[\(\（]?\s*[a-zA-Z0-9]+\s*[\)\）]?\s*中/,
+  /as shown in fig/i,
+  /see figure/i,
+  /in figure/i,
+];
+
+/**
+ * 判断一行文字是否是"图内文字"（标注、坐标轴等）
+ * 特征：短、孤立、不成段落
+ */
+function isFigureInternalText(line, pageWidth, allLines) {
+  const lineWidth = line.bbox.w;
+  const widthRatio = lineWidth / pageWidth;
+  
+  // 非常短的文字（< 15% 页宽）很可能是图内标注
+  if (widthRatio < 0.15) {
+    return true;
+  }
+  
+  // 检查是否与其他行形成连续文字块
+  const lineY = line.bbox.y;
+  const lineH = line.bbox.h;
+  const lineX = line.bbox.x;
+  
+  // 计算有多少相邻行（y 坐标接近，x 坐标对齐）
+  let adjacentLines = 0;
+  for (const other of allLines) {
+    if (other === line) continue;
+    
+    const yDiff = Math.abs(other.bbox.y - lineY);
+    const xDiff = Math.abs(other.bbox.x - lineX);
+    
+    // 相邻行：y 差距在 2 倍行高内，x 对齐（差距 < 50px）
+    if (yDiff < lineH * 2.5 && xDiff < 50) {
+      adjacentLines++;
+    }
+  }
+  
+  // 如果几乎没有相邻行，可能是图内文字
+  if (adjacentLines < 2 && widthRatio < 0.3) {
+    return true;
+  }
+  
+  return false;
+}
+
+/**
+ * 判断一行是否是真正的图标题（而非段落内引用）
+ */
+function isActualFigureCaption(line, allLines, pageWidth) {
+  const text = (line.text || "").trim();
+  
+  // 检查是否匹配标题模式
+  let matchesCaption = false;
+  for (const pattern of FIGURE_CAPTION_PATTERNS) {
+    if (pattern.test(text)) {
+      matchesCaption = true;
+      break;
+    }
+  }
+  
+  if (!matchesCaption) return false;
+  
+  // 检查是否是段落内引用
+  for (const pattern of FIGURE_REFERENCE_PATTERNS) {
+    if (pattern.test(text)) {
+      return false;  // 是引用，不是标题
+    }
+  }
+  
+  // 检查"图"是否在行首
+  const figureMatch = text.match(/^[图圖]|^fig/i);
+  if (!figureMatch) {
+    // "图"不在行首，可能是引用
+    // 进一步检查：如果行很长，"图"在中间，则是引用
+    const figurePos = text.search(/[图圖]|fig/i);
+    if (figurePos > 10) {
+      return false;  // "图"在中间，是引用
+    }
+  }
+  
+  // 检查上一行，判断是否是段落续行
+  const lineY = line.bbox.y;
+  const lineH = line.bbox.h;
+  
+  // 找到最近的上一行
+  let prevLine = null;
+  let minGap = Infinity;
+  for (const other of allLines) {
+    const otherBottom = other.bbox.y + other.bbox.h;
+    if (otherBottom < lineY) {
+      const gap = lineY - otherBottom;
+      if (gap < minGap) {
+        minGap = gap;
+        prevLine = other;
+      }
+    }
+  }
+  
+  if (prevLine) {
+    const prevWidth = prevLine.bbox.w;
+    const prevWidthRatio = prevWidth / pageWidth;
+    
+    // 如果上一行是满行段落（宽度 > 80%），且间距很小
+    // 则当前行可能是段落续行
+    if (prevWidthRatio > 0.8 && minGap < lineH * 1.5) {
+      // 上一行是满行，间距小，当前行可能是续行
+      // 但如果当前行以"图"开头且后面是描述，仍然可能是标题
+      // 检查当前行长度：如果很长（> 50% 页宽），可能是标题行
+      if (line.bbox.w / pageWidth < 0.4) {
+        // 当前行很短，可能是引用在段落末尾
+        return false;
+      }
+    }
+    
+    // 如果上一行是短行（段末），当前行更可能是标题
+    if (prevWidthRatio < 0.7) {
+      return true;  // 上一行是段末，当前行是新内容（标题）
+    }
+    
+    // 如果间距很大（> 2 倍行高），说明中间有图片，当前行是标题
+    if (minGap > lineH * 2) {
+      return true;
+    }
+  }
+  
+  // 默认：如果匹配模式且不是引用，认为是标题
+  return true;
+}
+
+/**
+ * 从 OCR 结果中提取真正的图标题
+ */
+function extractFigureCaptionsFromOcr(ocrResult, pageWidth) {
+  const captions = [];
+  const lines = ocrResult.lines || [];
+  
+  for (const line of lines) {
+    // 跳过图内文字
+    if (isFigureInternalText(line, pageWidth, lines)) {
+      continue;
+    }
+    
+    // 检查是否是真正的图标题
+    if (isActualFigureCaption(line, lines, pageWidth)) {
+      captions.push({
+        text: line.text.trim(),
+        bbox: line.bbox,
+        confidence: line.confidence,
+      });
+    }
+  }
+  
+  return captions;
+}
+
+/**
+ * 过滤出"段落文字"，排除图内文字
+ */
+function filterParagraphLines(ocrLines, pageWidth) {
+  return ocrLines.filter(line => !isFigureInternalText(line, pageWidth, ocrLines));
+}
+
+// LLM 分析图标题的提示词（改进版：区分标题和引用）
+function buildCaptionAnalysisPrompt(ocrLines) {
+  const linesJson = ocrLines.map((l, i) => ({
+    index: i,
+    text: l.text,
+    y: l.bbox.y,
+    x: l.bbox.x,
+    w: l.bbox.w,
+  }));
+  
+  return `你是图片标题识别专家。以下是 OCR 提取的文本行列表（含坐标）。
+请找出所有的**图片标题**（如"图 1.1 xxx"、"Figure 2.3 xxx"等）。
+
+OCR 文本行：
+${JSON.stringify(linesJson, null, 2)}
+
+请输出严格 JSON（无多余文字）：
+{
+  "captions": [
+    {
+      "index": 行索引,
+      "figure_id": "fig_1_1",
+      "caption_text": "完整标题文本",
+      "confidence": "high|medium|low"
+    }
+  ]
+}
+
+**重要：区分"图片标题"和"段落中的图片引用"**
+
+✅ 图片标题特征：
+- 以"图"、"圖"、"Figure"、"Fig."开头
+- 通常是独立的一行或一行的开始部分
+- 后面跟着对图片内容的描述
+- 例如："图 2.1 正态分布的概率密度函数"
+
+❌ 不是图片标题（是段落中的引用）：
+- "如图 2.1 所示..."
+- "见图 2.1，我们可以发现..."
+- "由图 2.1 可知..."
+- "在图 2.1 中..."
+- "as shown in Figure 2.1..."
+这些是在正文段落中引用图片，不是标题！
+
+**其他注意事项**：
+- 不要识别表格标题（表 X.X / Table X）
+- 如果没有找到图标题，返回空数组
+- 短文字（如"x", "y", "O"）可能是图内标注，不是标题`;
+}
+
+async function analyzeCaptionsWithLlm(ocrLines, llmCfg, maxRetries) {
+  if (!ocrLines || ocrLines.length === 0) {
+    return [];
+  }
+  
+  const system = "You are a strict JSON-only figure caption detector.";
+  const userText = buildCaptionAnalysisPrompt(ocrLines);
+  
+  try {
+    const resp = stripCodeFences(
+      await llmCallWithRetry(llmCfg, { system, userText, imageDataUrl: null, signal: null }, { maxRetries })
+    );
+    const parsed = safeJsonParse(resp);
+    if (!parsed.ok) {
+      log("LLM 图标题分析返回非 JSON，使用正则回退");
+      return [];
+    }
+    
+    const captions = [];
+    for (const cap of parsed.value.captions || []) {
+      const lineIdx = cap.index;
+      if (lineIdx >= 0 && lineIdx < ocrLines.length) {
+        captions.push({
+          text: cap.caption_text || ocrLines[lineIdx].text,
+          bbox: ocrLines[lineIdx].bbox,
+          figureId: cap.figure_id,
+          confidence: cap.confidence,
+        });
+      }
+    }
+    return captions;
+  } catch (e) {
+    log(`LLM 图标题分析失败: ${e.message || e}`);
+    return [];
+  }
+}
+
+// ---------------------------
+// Image Processing: 改进的"文字夹逼法"图片检测
+// ---------------------------
+
+function canvasToGrayscale(canvas) {
+  const ctx = canvas.getContext("2d");
+  const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const data = imageData.data;
+  const gray = new Uint8Array(canvas.width * canvas.height);
+  
+  for (let i = 0; i < data.length; i += 4) {
+    // 灰度 = 0.299*R + 0.587*G + 0.114*B
+    gray[i / 4] = Math.round(0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]);
+  }
+  
+  return { gray, width: canvas.width, height: canvas.height };
+}
+
+/**
+ * 判断一行是否是"段落末行"（短行，不是满行）
+ * 段落末行通常比正常行短，且上一行是满行
+ */
+function isParagraphEndingLine(line, allLines, pageWidth) {
+  const lineWidth = line.bbox.w;
+  const widthRatio = lineWidth / pageWidth;
+  
+  // 如果是满行（> 75% 页宽），不是段落末行
+  if (widthRatio > 0.75) {
+    return false;
+  }
+  
+  // 如果是短行（< 75% 页宽），检查上一行
+  // 找到紧邻的上一行
+  const lineY = line.bbox.y;
+  const lineH = line.bbox.h;
+  
+  let prevLine = null;
+  let minGap = Infinity;
+  for (const other of allLines) {
+    const otherBottom = other.bbox.y + other.bbox.h;
+    if (otherBottom < lineY && otherBottom > lineY - lineH * 3) {
+      const gap = lineY - otherBottom;
+      if (gap < minGap) {
+        minGap = gap;
+        prevLine = other;
+      }
+    }
+  }
+  
+  if (prevLine) {
+    const prevWidthRatio = prevLine.bbox.w / pageWidth;
+    // 上一行是满行，当前行是短行 = 段落末行
+    if (prevWidthRatio > 0.75) {
+      return true;
+    }
+  }
+  
+  return false;
+}
+
+/**
+ * 生成图片上边界的候选列表（迭代法用）
+ * 从标题往上，找到所有可能的"图片上边界"候选位置
+ * 
+ * @param {Array} ocrLines - OCR 识别的段落文字行
+ * @param {Object} captionBbox - 图标题的 bbox
+ * @param {number} pageWidth - 页面宽度
+ * @param {number} pageHeight - 页面高度
+ * @returns {Array} 候选上边界列表，按优先级排序（最可能的在前）
+ */
+function generateTopBoundaryCandidates(ocrLines, captionBbox, pageWidth, pageHeight) {
+  const candidates = [];
+  const padding = 8;
+  const topMargin = pageHeight * 0.05;
+  
+  // 筛选在标题上方的文字行
+  const linesAbove = ocrLines.filter(line => {
+    const lineBottom = line.bbox.y + line.bbox.h;
+    return lineBottom < captionBbox.y - 20; // 留点余量
+  });
+  
+  if (linesAbove.length === 0) {
+    // 没有上方文字，只有页面顶部作为候选
+    candidates.push({
+      figureTop: topMargin,
+      reason: "page_top",
+      confidence: "medium",
+    });
+    return candidates;
+  }
+  
+  // 按 y 坐标降序排列（从下往上）
+  linesAbove.sort((a, b) => (b.bbox.y + b.bbox.h) - (a.bbox.y + a.bbox.h));
+  
+  // 计算平均行高
+  let totalHeight = 0;
+  for (const line of linesAbove) {
+    totalHeight += line.bbox.h;
+  }
+  const avgLineHeight = totalHeight / linesAbove.length;
+  
+  // 遍历每个上方文字行，生成候选
+  for (let i = 0; i < linesAbove.length; i++) {
+    const line = linesAbove[i];
+    const lineBottom = line.bbox.y + line.bbox.h;
+    const gap = captionBbox.y - lineBottom;
+    
+    // 跳过离标题太近的行（间距 < 1.5 倍行高）
+    if (gap < avgLineHeight * 1.5) {
+      continue;
+    }
+    
+    // 检查是否是段落末行
+    const isEndingLine = isParagraphEndingLine(line, linesAbove, pageWidth);
+    
+    // 计算候选上边界
+    const figureTop = lineBottom + Math.min(avgLineHeight * 0.3, 10);
+    
+    // 判断条件：间距大，或者当前行是满行（明确的段落边界）
+    const significantGap = Math.max(avgLineHeight * 2, 50);
+    const lineWidthRatio = line.bbox.w / pageWidth;
+    
+    let confidence = "low";
+    let reason = "text_boundary";
+    
+    if (gap > significantGap) {
+      confidence = "high";
+      reason = "large_gap";
+    } else if (lineWidthRatio > 0.8 && !isEndingLine) {
+      // 满行且不是段落末行（下一行开始是新内容）
+      confidence = "medium";
+      reason = "full_line_boundary";
+    } else if (isEndingLine) {
+      // 段落末行，图片可能在更上方
+      confidence = "low";
+      reason = "paragraph_ending";
+    }
+    
+    candidates.push({
+      figureTop,
+      lineBottom,
+      line,
+      reason,
+      confidence,
+      gap,
+      isEndingLine,
+    });
+  }
+  
+  // 添加页面顶部作为最后的候选
+  candidates.push({
+    figureTop: topMargin,
+    reason: "page_top",
+    confidence: "low",
+  });
+  
+  // 按优先级排序：high > medium > low，同优先级按 figureTop 降序（离标题近的优先）
+  const priorityOrder = { high: 0, medium: 1, low: 2 };
+  candidates.sort((a, b) => {
+    const pDiff = priorityOrder[a.confidence] - priorityOrder[b.confidence];
+    if (pDiff !== 0) return pDiff;
+    return b.figureTop - a.figureTop; // figureTop 大的（离标题近）优先
+  });
+  
+  return candidates;
+}
+
+/**
+ * LLM 验证裁剪的图片是否完整
+ * @param {string} croppedImageDataUrl - 裁剪后的图片 data URL
+ * @param {string} captionText - 图标题文本
+ * @param {Object} llmCfg - LLM 配置
+ * @param {number} maxRetries - 最大重试次数
+ * @returns {Object} { isComplete: boolean, issue: string|null }
+ */
+async function validateCroppedFigureWithLlm(croppedImageDataUrl, captionText, llmCfg, maxRetries) {
+  const system = "You are a strict JSON-only image validation assistant.";
+  const userText = `请判断这张裁剪的图片是否完整。
+
+图片标题：${captionText}
+
+请检查：
+1. 图片是否完整显示了标题所描述的内容？
+2. 图片顶部是否被截断（缺少部分内容）？
+3. 图片顶部是否包含了不相关的文字（如段落文字）？
+4. 图片是否有意义（不是空白或乱码）？
+
+请输出严格 JSON：
+{
+  "is_complete": true或false,
+  "issue": "问题描述，如果完整则为null",
+  "suggestion": "top_ok" 或 "need_expand_up" 或 "need_shrink_down"
+}
+
+- "top_ok": 顶部边界正确
+- "need_expand_up": 图片被截断，需要向上扩展
+- "need_shrink_down": 顶部包含多余内容，需要向下收缩`;
+
+  try {
+    const resp = stripCodeFences(
+      await llmCallWithRetry(llmCfg, { system, userText, imageDataUrl: croppedImageDataUrl, signal: null }, { maxRetries })
+    );
+    const parsed = safeJsonParse(resp);
+    if (!parsed.ok) {
+      return { isComplete: false, issue: "LLM 返回非 JSON", suggestion: "top_ok" };
+    }
+    return {
+      isComplete: parsed.value.is_complete === true,
+      issue: parsed.value.issue || null,
+      suggestion: parsed.value.suggestion || "top_ok",
+    };
+  } catch (e) {
+    log(`LLM 图片验证失败: ${e.message || e}`);
+    return { isComplete: false, issue: "LLM 调用失败", suggestion: "top_ok" };
+  }
+}
+
+/**
+ * LLM 从多个候选中选择最佳裁剪
+ * @param {Array} candidateImages - 候选图片列表 [{ dataUrl, figureTop, reason }]
+ * @param {string} captionText - 图标题文本
+ * @param {Object} llmCfg - LLM 配置
+ * @param {number} maxRetries - 最大重试次数
+ * @returns {number} 最佳候选的索引
+ */
+async function selectBestCropWithLlm(candidateImages, captionText, llmCfg, maxRetries) {
+  if (candidateImages.length === 0) return -1;
+  if (candidateImages.length === 1) return 0;
+  
+  // 构建提示词，描述每个候选
+  const system = "You are a strict JSON-only image selection assistant.";
+  let userText = `图片标题：${captionText}
+
+我有 ${candidateImages.length} 个候选裁剪结果。请选择最完整、最正确的那个。
+
+候选列表：
+`;
+  
+  for (let i = 0; i < candidateImages.length; i++) {
+    userText += `- 候选 ${i}: ${candidateImages[i].reason}\n`;
+  }
+  
+  userText += `
+请根据图片内容判断哪个裁剪最好（图片完整、没有截断、没有多余文字）。
+
+输出严格 JSON：
+{
+  "best_index": 最佳候选的索引（0到${candidateImages.length - 1}）,
+  "reason": "选择理由"
+}`;
+
+  // 由于无法一次发送多张图片，我们发送第一张让 LLM 作为参考
+  // 实际上这个函数可能需要改进，但先用简单方案
+  try {
+    const resp = stripCodeFences(
+      await llmCallWithRetry(llmCfg, { 
+        system, 
+        userText, 
+        imageDataUrl: candidateImages[0].dataUrl, 
+        signal: null 
+      }, { maxRetries })
+    );
+    const parsed = safeJsonParse(resp);
+    if (!parsed.ok || typeof parsed.value.best_index !== "number") {
+      return 0; // 默认选第一个
+    }
+    const idx = parsed.value.best_index;
+    return (idx >= 0 && idx < candidateImages.length) ? idx : 0;
+  } catch (e) {
+    log(`LLM 选择最佳裁剪失败: ${e.message || e}`);
+    return 0;
+  }
+}
+
+/**
+ * 使用列密度扫描确定水平边界
+ * @param {Object} grayData - 灰度图像数据
+ * @param {number} top - 搜索区域顶部
+ * @param {number} bottom - 搜索区域底部
+ * @param {number} hintLeft - 参考左边界（标题 x）
+ * @param {number} hintRight - 参考右边界（标题 x + w）
+ * @returns {Object} { left, right }
+ */
+function findHorizontalBoundsByDensity(grayData, top, bottom, hintLeft, hintRight) {
+  const { gray, width, height } = grayData;
+  const whiteThreshold = 240;
+  const densityThreshold = 0.03; // 列密度阈值
+  
+  // 扩展搜索范围（标题可能比图片窄）
+  const searchMargin = Math.max(100, (hintRight - hintLeft) * 0.5);
+  const searchLeft = Math.max(0, hintLeft - searchMargin);
+  const searchRight = Math.min(width, hintRight + searchMargin);
+  
+  const rowCount = Math.max(1, bottom - top);
+  
+  // 计算每列的像素密度
+  const columnDensity = [];
+  for (let x = searchLeft; x < searchRight; x++) {
+    let nonWhiteCount = 0;
+    for (let y = top; y < bottom; y++) {
+      if (gray[y * width + x] < whiteThreshold) {
+        nonWhiteCount++;
+      }
+    }
+    columnDensity.push({
+      x,
+      density: nonWhiteCount / rowCount,
+    });
+  }
+  
+  // 使用滑动窗口平滑（减少噪点影响）
+  const windowSize = 5;
+  const smoothedDensity = [];
+  for (let i = 0; i < columnDensity.length; i++) {
+    let sum = 0;
+    let count = 0;
+    for (let j = Math.max(0, i - windowSize); j <= Math.min(columnDensity.length - 1, i + windowSize); j++) {
+      sum += columnDensity[j].density;
+      count++;
+    }
+    smoothedDensity.push({
+      x: columnDensity[i].x,
+      density: sum / count,
+    });
+  }
+  
+  // 找左边界：从左向右，第一个密度超过阈值的位置
+  let left = hintLeft;
+  for (let i = 0; i < smoothedDensity.length; i++) {
+    if (smoothedDensity[i].density > densityThreshold) {
+      left = smoothedDensity[i].x;
+      break;
+    }
+  }
+  
+  // 找右边界：从右向左，第一个密度超过阈值的位置
+  let right = hintRight;
+  for (let i = smoothedDensity.length - 1; i >= 0; i--) {
+    if (smoothedDensity[i].density > densityThreshold) {
+      right = smoothedDensity[i].x;
+      break;
+    }
+  }
+  
+  // 确保 right > left
+  if (right <= left) {
+    // 回退到参考值
+    left = hintLeft;
+    right = hintRight;
+  }
+  
+  return { left, right };
+}
+
+/**
+ * 根据候选上边界构建 bbox
+ */
+function buildBboxFromCandidate(candidate, captionBbox, grayData, pageWidth, pageHeight) {
+  const padding = 8;
+  const figureTop = candidate.figureTop;
+  const figureBottom = captionBbox.y - padding;
+  
+  const figureHeight = figureBottom - figureTop;
+  if (figureHeight < 30) {
+    return null;
+  }
+  
+  const hintLeft = captionBbox.x;
+  const hintRight = captionBbox.x + captionBbox.w;
+  
+  const { left, right } = findHorizontalBoundsByDensity(
+    grayData,
+    figureTop,
+    figureBottom,
+    hintLeft,
+    hintRight
+  );
+  
+  const bbox = {
+    x: Math.max(0, left - padding),
+    y: Math.max(0, figureTop),
+    w: Math.min(pageWidth, right - left + padding * 2),
+    h: figureHeight,
+  };
+  
+  if (bbox.w < 30 || bbox.h < 30) {
+    return null;
+  }
+  
+  const aspectRatio = bbox.w / bbox.h;
+  if (aspectRatio > 10 || aspectRatio < 0.1) {
+    return null;
+  }
+  
+  return bbox;
+}
+
+/**
+ * 从 canvas 裁剪指定区域并返回 data URL
+ */
+function cropCanvasToDataUrl(canvas, bbox) {
+  const cropCanvas = document.createElement("canvas");
+  cropCanvas.width = bbox.w;
+  cropCanvas.height = bbox.h;
+  const ctx = cropCanvas.getContext("2d");
+  ctx.drawImage(canvas, bbox.x, bbox.y, bbox.w, bbox.h, 0, 0, bbox.w, bbox.h);
+  return cropCanvas.toDataURL("image/png");
+}
+
+/**
+ * 迭代式图片边界检测（LLM 验证版）
+ * 
+ * 算法流程：
+ * 1. 生成多个候选上边界
+ * 2. 对每个候选裁剪图片，让 LLM 验证是否完整
+ * 3. 如果 LLM 认为完整，返回该 bbox
+ * 4. 如果所有候选都不完整，让 LLM 从中选择最佳
+ * 
+ * @param {HTMLCanvasElement} canvas - 页面 canvas
+ * @param {Array} ocrLines - OCR 识别的段落文字行
+ * @param {Object} captionBbox - 图标题的 bbox
+ * @param {string} captionText - 图标题文本
+ * @param {Object} grayData - 灰度图像数据
+ * @param {number} pageWidth - 页面宽度
+ * @param {number} pageHeight - 页面高度
+ * @param {Object} llmCfg - LLM 配置
+ * @param {number} maxRetries - 最大重试次数
+ * @returns {Object|null} { bbox, method, validatedByLlm }
+ */
+async function detectFigureBboxIterative(canvas, ocrLines, captionBbox, captionText, grayData, pageWidth, pageHeight, llmCfg, maxRetries) {
+  const padding = 8;
+  
+  // 第一步：生成候选上边界
+  const candidates = generateTopBoundaryCandidates(ocrLines, captionBbox, pageWidth, pageHeight);
+  
+  if (candidates.length === 0) {
+    log("  无法生成候选上边界");
+    return null;
+  }
+  
+  log(`  生成 ${candidates.length} 个候选上边界`);
+  
+  // 第二步：对高置信度候选，直接使用（不调用 LLM 验证）
+  const highConfidenceCandidates = candidates.filter(c => c.confidence === "high");
+  if (highConfidenceCandidates.length > 0) {
+    const best = highConfidenceCandidates[0];
+    const bbox = buildBboxFromCandidate(best, captionBbox, grayData, pageWidth, pageHeight);
+    if (bbox) {
+      log(`  使用高置信度候选 (${best.reason})`);
+      return { bbox, method: "text_sandwich_high_confidence", validatedByLlm: false };
+    }
+  }
+  
+  // 第三步：对其他候选，迭代验证
+  const candidateResults = [];
+  
+  for (let i = 0; i < Math.min(candidates.length, 4); i++) { // 最多验证 4 个
+    const candidate = candidates[i];
+    const bbox = buildBboxFromCandidate(candidate, captionBbox, grayData, pageWidth, pageHeight);
+    
+    if (!bbox) {
+      continue;
+    }
+    
+    // 裁剪图片
+    const croppedDataUrl = cropCanvasToDataUrl(canvas, bbox);
+    
+    candidateResults.push({
+      candidate,
+      bbox,
+      dataUrl: croppedDataUrl,
+      reason: candidate.reason,
+    });
+    
+    // LLM 验证
+    log(`  验证候选 ${i + 1}/${candidates.length} (${candidate.reason})...`);
+    const validation = await validateCroppedFigureWithLlm(croppedDataUrl, captionText, llmCfg, maxRetries);
+    
+    if (validation.isComplete) {
+      log(`  ✓ 候选 ${i + 1} 验证通过`);
+      return { bbox, method: "iterative_validated", validatedByLlm: true };
+    } else {
+      log(`  ✗ 候选 ${i + 1}: ${validation.issue || "不完整"} (${validation.suggestion})`);
+      
+      // 根据建议决定是否继续
+      if (validation.suggestion === "need_shrink_down") {
+        // 需要向下收缩，跳过后续更大的候选
+        continue;
+      }
+      // need_expand_up: 继续尝试下一个候选（上边界更高）
+    }
+  }
+  
+  // 第四步：如果没有通过验证的，选择最佳候选
+  if (candidateResults.length > 0) {
+    log(`  所有候选均未通过验证，选择最可能的...`);
+    
+    // 优先选择 high/medium confidence
+    const sorted = candidateResults.sort((a, b) => {
+      const order = { high: 0, medium: 1, low: 2 };
+      return (order[a.candidate.confidence] || 2) - (order[b.candidate.confidence] || 2);
+    });
+    
+    // 选第一个（最高置信度）
+    const best = sorted[0];
+    log(`  使用候选: ${best.reason}`);
+    return { bbox: best.bbox, method: "iterative_fallback", validatedByLlm: false };
+  }
+  
+  return null;
+}
+
+/**
+ * 简单版图片边界检测（不调用 LLM 验证，用于快速模式）
+ */
+function detectFigureBboxSimple(ocrLines, captionBbox, grayData, pageWidth, pageHeight) {
+  const candidates = generateTopBoundaryCandidates(ocrLines, captionBbox, pageWidth, pageHeight);
+  
+  if (candidates.length === 0) {
+    return null;
+  }
+  
+  // 选择最高置信度的候选
+  const best = candidates[0];
+  return buildBboxFromCandidate(best, captionBbox, grayData, pageWidth, pageHeight);
+}
+
+// 保留旧的边缘检测作为备用（某些情况可能仍有用）
+function sobelEdgeDetection(grayData, threshold) {
+  const { gray, width, height } = grayData;
+  const edges = new Uint8Array(width * height);
+  
+  const sobelX = [-1, 0, 1, -2, 0, 2, -1, 0, 1];
+  const sobelY = [-1, -2, -1, 0, 0, 0, 1, 2, 1];
+  
+  for (let y = 1; y < height - 1; y++) {
+    for (let x = 1; x < width - 1; x++) {
+      let gx = 0, gy = 0;
+      
+      for (let ky = -1; ky <= 1; ky++) {
+        for (let kx = -1; kx <= 1; kx++) {
+          const idx = (y + ky) * width + (x + kx);
+          const kidx = (ky + 1) * 3 + (kx + 1);
+          gx += gray[idx] * sobelX[kidx];
+          gy += gray[idx] * sobelY[kidx];
+        }
+      }
+      
+      const magnitude = Math.sqrt(gx * gx + gy * gy);
+      edges[y * width + x] = magnitude > threshold ? 255 : 0;
+    }
+  }
+  
+  return edges;
+}
+
+// ---------------------------
+// Combined Figure Detection (迭代验证版)
+// ---------------------------
+
+async function detectFigureBboxes(canvas, pageNum) {
+  const useOcr = document.getElementById("useOcrDetection")?.checked ?? true;
+  const useLlmValidation = document.getElementById("useLlmValidation")?.checked ?? true;
+  
+  const width = canvas.width;
+  const height = canvas.height;
+  
+  const detectedFigures = [];
+  
+  if (!useOcr) {
+    log(`页 ${pageNum}: OCR 辅助定位已禁用，跳过图片检测`);
+    return detectedFigures;
+  }
+  
+  // 1. OCR 提取文字
+  log(`页 ${pageNum}: 运行 OCR...`);
+  let ocrResult;
+  try {
+    ocrResult = await ocrExtractTextBlocks(canvas);
+    log(`页 ${pageNum}: OCR 完成，识别 ${ocrResult.lines.length} 行文字`);
+  } catch (e) {
+    log(`页 ${pageNum}: OCR 失败: ${e.message || e}`);
+    return detectedFigures;
+  }
+  
+  // 2. 过滤出段落文字（排除图内孤立文字）
+  const paragraphLines = filterParagraphLines(ocrResult.lines, width);
+  log(`页 ${pageNum}: 过滤后段落文字 ${paragraphLines.length} 行`);
+  
+  // 3. 用改进的正则+上下文分析识别图标题
+  let captions = extractFigureCaptionsFromOcr(ocrResult, width);
+  log(`页 ${pageNum}: 正则识别到 ${captions.length} 个图标题`);
+  
+  // 4. 如果正则没找到，尝试用 LLM 分析（仅分析标题，不估计坐标）
+  if (captions.length === 0 && paragraphLines.length > 0) {
+    log(`页 ${pageNum}: 尝试 LLM 分析图标题...`);
+    const llmCfg = getRoleConfig("transcriber");
+    const { maxRetries } = getRunSettings();
+    captions = await analyzeCaptionsWithLlm(paragraphLines, llmCfg, maxRetries);
+    log(`页 ${pageNum}: LLM 识别到 ${captions.length} 个图标题`);
+  }
+  
+  if (captions.length === 0) {
+    log(`页 ${pageNum}: 未检测到图标题`);
+    return detectedFigures;
+  }
+  
+  // 5. 准备灰度图像用于水平边界检测
+  const grayData = canvasToGrayscale(canvas);
+  
+  // 获取 LLM 配置（用于验证）
+  const llmCfg = getRoleConfig("transcriber");
+  const { maxRetries } = getRunSettings();
+  
+  // 6. 对每个图标题，使用迭代验证算法检测图片区域
+  captions.sort((a, b) => a.bbox.y - b.bbox.y);
+  
+  for (let i = 0; i < captions.length; i++) {
+    const caption = captions[i];
+    const figureId = caption.figureId || `p${pageNum}_fig${i + 1}`;
+    
+    log(`页 ${pageNum}: 处理图标题 "${caption.text.slice(0, 30)}..." (y=${caption.bbox.y})`);
+    
+    // 过滤：排除所有图标题行
+    const relevantOcrLines = paragraphLines.filter(line => {
+      const isCaption = captions.some(cap => 
+        Math.abs(cap.bbox.y - line.bbox.y) < 5 && 
+        cap.text.includes(line.text.slice(0, 10))
+      );
+      return !isCaption;
+    });
+    
+    let result = null;
+    
+    if (useLlmValidation) {
+      // 使用迭代验证算法（LLM 验证裁剪结果）
+      result = await detectFigureBboxIterative(
+        canvas,
+        relevantOcrLines,
+        caption.bbox,
+        caption.text,
+        grayData,
+        width,
+        height,
+        llmCfg,
+        maxRetries
+      );
+    } else {
+      // 快速模式：不使用 LLM 验证
+      const bbox = detectFigureBboxSimple(relevantOcrLines, caption.bbox, grayData, width, height);
+      if (bbox) {
+        result = { bbox, method: "simple", validatedByLlm: false };
+      }
+    }
+    
+    if (result && result.bbox) {
+      const bbox = normalizeBbox(result.bbox, width, height);
+      if (bbox) {
+        log(`页 ${pageNum}: 检测成功 - ${figureId} (${bbox.x},${bbox.y},${bbox.w},${bbox.h}) [${result.method}]`);
+        detectedFigures.push({
+          id: figureId,
+          bbox,
+          caption: caption.text,
+          captionBbox: caption.bbox,
+          method: result.method,
+          validatedByLlm: result.validatedByLlm,
+        });
+      }
+    } else {
+      log(`页 ${pageNum}: 检测失败 - ${figureId}`);
+    }
+  }
+  
+  return detectedFigures;
 }
 
 // ---------------------------
@@ -783,6 +1821,21 @@ function buildTranscriptionPrompt({ pageNum, width, height }) {
 5) 每个图像必须有唯一 ID：p${pageNum}_fig1, p${pageNum}_fig2, ...
 6) 你的 LaTeX 中必须引用这些 PNG：\\includegraphics{p${pageNum}_fig1.png} 等（文件名与 ID 对齐）。
 
+【LaTeX 可编译性要求 - 必须遵守】：
+- 数学公式：行内用 $...$，行间用 \\[...\\] 或 equation 环境，不要混用
+- 所有数学环境必须正确闭合：\\begin{...} 必须有对应的 \\end{...}
+- 空集符号用 \\varnothing 或 \\emptyset，不要用 \\phi
+- 定理/定义/例题等使用结构化环境（如有）：
+  * 定理用 \\begin{theorem}...\\end{theorem}
+  * 定义用 \\begin{definition}...\\end{definition}
+  * 例题用 \\begin{example}...\\end{example}
+  * 证明用 \\begin{proof}...\\end{proof}
+- 如果是目录页，不要输出 \\section/\\chapter 命令，只输出纯文本内容
+- 中文内容正常输出，不需要特殊处理（文档会用 ctexart）
+- 避免全角标点进入数学环境
+- figure/table 环境必须正确闭合
+- 不要输出 \\documentclass、\\begin{document} 等文档框架命令
+
 坐标系：
 - 页面像素尺寸：width=${width}, height=${height}
 - bbox 使用左上角为原点的像素坐标：{x,y,w,h}，并确保 bbox 在页面范围内。
@@ -854,6 +1907,23 @@ function buildOrganizerPrompt({ windowPages }) {
   ]
 }
 
+严格规则：
+1) 章节结构只能基于输入里 headings 的显式证据，不得新增不存在的标题。
+2) 如果没有足够证据，宁可不分章。
+3) latex_body 必须按页顺序包含所有页的内容（可插入 \\section 等），并保留每页边界注释。
+
+【可编译性要求】：
+- 不要在 latex_body 中包含 \\documentclass、\\begin{document}、\\end{document}
+- 章节层级必须正确：ctexart 不支持 \\chapter，请使用 \\section 作为最高级
+- 所有数学环境必须正确闭合
+- 不要重复插入相同的章节命令
+- 保持每页的 LaTeX 内容完整，不要截断环境
+
+输入 windowPages（JSON）：
+${JSON.stringify(windowPages, null, 2)}
+`;
+}
+
 function buildWindowPlanPrompt({ windowPages }) {
   return `
 你在做“滑动窗口初步组装”（先转写后组织）。输入是一组连续页的转写结果（含 headings 显式证据）。
@@ -876,15 +1946,9 @@ function buildWindowPlanPrompt({ windowPages }) {
 2) 如证据不足，宁可输出空 insertions。
 3) page 必须是窗口内页码之一。
 
-输入 windowPages（JSON）：
-${JSON.stringify(windowPages, null, 2)}
-`;
-}
-
-严格规则：
-1) 章节结构只能基于输入里 headings 的显式证据，不得新增不存在的标题。
-2) 如果没有足够证据，宁可不分章。
-3) latex_body 必须按页顺序包含所有页的内容（可插入 \\section 等），并保留每页边界注释。
+【可编译性注意】：
+- 使用 ctexart 时，level 不要使用 chapter，应使用 section 作为最高级
+- 章节层级顺序：section > subsection > subsubsection
 
 输入 windowPages（JSON）：
 ${JSON.stringify(windowPages, null, 2)}
@@ -956,6 +2020,10 @@ function buildCropRefinePrompt({ pageNum, width, height, figureId, bbox }) {
 `;
 }
 
+/**
+ * @deprecated 此函数已废弃。新算法使用迭代验证（validateCroppedFigureWithLlm），
+ * LLM 只判断图片是否完整，不再估计坐标。保留此函数仅供向后兼容。
+ */
 async function refineFigureBboxWithLlm({
   pageNum,
   width,
@@ -1073,6 +2141,22 @@ async function transcribeAndCrop() {
     out.height = canvas.height;
     out.getContext("2d").drawImage(canvas, 0, 0);
 
+    // === 新增：OCR + 图像处理检测图片 ===
+    const useOcrDetection = document.getElementById("useOcrDetection")?.checked ?? true;
+    let ocrDetectedFigures = [];
+    
+    if (useOcrDetection) {
+      try {
+        setStage(`Transcribe: page ${pageNum} (OCR 检测)`);
+        ocrDetectedFigures = await detectFigureBboxes(canvas, pageNum);
+        log(`页 ${pageNum}: OCR 检测到 ${ocrDetectedFigures.length} 个图片`);
+      } catch (e) {
+        log(`页 ${pageNum}: OCR 检测失败，将使用 LLM 检测: ${e.message || e}`);
+      }
+    }
+
+    // === LLM 转写（LaTeX + 结构） ===
+    setStage(`Transcribe: page ${pageNum} (LLM)`);
     const dataUrl = canvas.toDataURL("image/png");
     const system = "You are a careful math textbook transcriber. Output JSON only.";
     const userText = buildTranscriptionPrompt({ pageNum, width, height });
@@ -1085,7 +2169,7 @@ async function transcribeAndCrop() {
     );
     respText = stripCodeFences(respText);
 
-    // If it isn't JSON, do one stricter retry (counts as one attempt through retry wrapper above, so do it manually here)
+    // If it isn't JSON, do one stricter retry
     const parsed = safeJsonParse(respText);
     if (!parsed.ok) {
       log(`Page ${pageNum}: output not JSON. Retrying once with stricter JSON-only instruction.`);
@@ -1104,35 +2188,52 @@ async function transcribeAndCrop() {
     const latex = typeof obj.latex === "string" ? obj.latex : "";
     const annotations =
       obj.annotations && typeof obj.annotations === "object" ? obj.annotations : { headings: [], notes: [] };
-    const figures = Array.isArray(obj.figures) ? obj.figures : [];
+    const llmFigures = Array.isArray(obj.figures) ? obj.figures : [];
 
-    // Crop figures (LLM decides which real figures to keep; if none -> no image saved)
-    for (let fi = 0; fi < figures.length; fi++) {
-      const fig = figures[fi] || {};
-      const desired = String(fig.id || `p${pageNum}_fig${fi + 1}`);
-      const id = uniqueImageId(desired);
-      const bbox0 = normalizeBbox(fig.bbox, width, height);
-      if (!bbox0) {
-        log(`Page ${pageNum}: skip figure ${desired} (invalid bbox).`);
+    // === 合并图片检测结果：OCR 优先，LLM 补充 ===
+    const ocrFigureIds = new Set(ocrDetectedFigures.map(f => f.id));
+    const finalFigures = [...ocrDetectedFigures];
+    
+    // 添加 LLM 检测到但 OCR 没检测到的图片
+    for (const fig of llmFigures) {
+      const figId = fig.id || `p${pageNum}_fig${finalFigures.length + 1}`;
+      if (!ocrFigureIds.has(figId)) {
+        // LLM 检测到的图，OCR 没检测到
+        const bbox0 = normalizeBbox(fig.bbox, width, height);
+        if (bbox0) {
+          finalFigures.push({
+            id: figId,
+            bbox: bbox0,
+            caption: fig.evidence || "",
+            method: "llm",
+          });
+        }
+      }
+    }
+
+    // === 裁剪图片 ===
+    const processedFigures = [];
+    for (let fi = 0; fi < finalFigures.length; fi++) {
+      const fig = finalFigures[fi];
+      const id = uniqueImageId(fig.id);
+      let bbox = fig.bbox;
+      
+      // 新算法已经通过迭代验证确保 bbox 正确，无需额外 LLM 校正
+      // （旧的 refineFigureBboxWithLlm 已废弃，不再使用 LLM 估计坐标）
+      
+      // 最终验证 bbox
+      bbox = normalizeBbox(bbox, width, height);
+      if (!bbox) {
+        log(`Page ${pageNum}: skip figure ${id} (invalid bbox after processing).`);
         continue;
       }
-      const bbox = await refineFigureBboxWithLlm({
-        pageNum,
-        width,
-        height,
-        figureId: id,
-        initialBbox: bbox0,
-        pageCanvas: canvas,
-        llmCfg: transcriberCfg,
-        maxRetries,
-        maxRefine: maxCropRefine,
-        signal,
-      });
+      
       const blob = await cropPngFromCanvas(canvas, bbox);
       if (!blob) {
         log(`Page ${pageNum}: crop failed for ${id}.`);
         continue;
       }
+      
       const filename = `${id}.png`;
       const referencedIn = [pageNum];
       state.images.set(id, {
@@ -1142,10 +2243,21 @@ async function transcribeAndCrop() {
         bbox,
         blob,
         referencedIn,
-        evidence: String(fig.evidence || ""),
+        evidence: fig.caption || "",
+        detectionMethod: fig.method || "ocr",
       });
+      
+      processedFigures.push({
+        id,
+        bbox,
+        evidence: fig.caption || "",
+        method: fig.method || "ocr",
+      });
+      
+      log(`页 ${pageNum}: 裁剪图片 ${id} (${fig.method || "ocr"}) - ${bbox.w}x${bbox.h}`);
     }
 
+    // 更新 LaTeX 中的图片引用
     const includeIds = extractIncludeGraphicsIds(latex);
     for (const id of includeIds) {
       const img = state.images.get(id);
@@ -1160,10 +2272,13 @@ async function transcribeAndCrop() {
       height,
       latex,
       annotations,
-      figures,
+      figures: processedFigures,
       raw: obj,
     });
-    log(`Transcribed page ${pageNum}: latex_chars=${latex.length}, figures=${figures.length}`);
+    
+    const ocrCount = processedFigures.filter(f => f.method !== "llm").length;
+    const llmCount = processedFigures.filter(f => f.method === "llm").length;
+    log(`Transcribed page ${pageNum}: latex=${latex.length}字符, 图片=${processedFigures.length}(OCR:${ocrCount}, LLM:${llmCount})`);
     updateOutputsPanels();
   }
 
@@ -1274,22 +2389,49 @@ function collectHeadingsInOrder() {
 }
 
 function buildLatexPreamble(template) {
+  // 通用的定理环境定义
+  const theoremDefs = `
+% 定理环境定义
+\\theoremstyle{definition}
+\\newtheorem{definition}{定义}[section]
+\\newtheorem{example}{例}[section]
+\\newtheorem{exercise}{习题}[section]
+\\theoremstyle{plain}
+\\newtheorem{theorem}{定理}[section]
+\\newtheorem{lemma}{引理}[section]
+\\newtheorem{corollary}{推论}[section]
+\\newtheorem{proposition}{命题}[section]
+\\theoremstyle{remark}
+\\newtheorem{remark}{注}[section]
+`;
+
   if (template === "article") {
+    // article 模板：使用 pdflatex，需要 inputenc 处理 UTF-8
+    // 注意：如果包含中文，建议切换到 ctexart
     return `\\documentclass{article}
 \\usepackage[utf8]{inputenc}
+\\usepackage[T1]{fontenc}
 \\usepackage{amsmath,amssymb,amsthm}
 \\usepackage{graphicx}
 \\usepackage{geometry}
+\\usepackage{hyperref}
 \\geometry{margin=1in}
+${theoremDefs}
 \\begin{document}
 `;
   }
-  // ctexart default
-  return `\\documentclass[UTF8]{ctexart}
+  
+  // ctexart 模板：必须使用 xelatex 或 lualatex 编译
+  // 编译命令: xelatex main.tex
+  return `% !TEX program = xelatex
+% 编译方式: xelatex main.tex （不要使用 pdflatex）
+\\documentclass[UTF8,a4paper]{ctexart}
 \\usepackage{amsmath,amssymb,amsthm}
 \\usepackage{graphicx}
 \\usepackage{geometry}
+\\usepackage{hyperref}
 \\geometry{margin=1in}
+${theoremDefs}
 \\begin{document}
 `;
 }
@@ -1347,6 +2489,7 @@ async function buildWindowPlansConcurrently() {
   if (!pages.length) throw new Error("No per-page results yet.");
 
   const plannerCfg = getRoleConfig("planner");
+  const { maxRetries } = getRunSettings();
   const windowSize = clamp(Number($("organizerWindow").value || 7), 3, 15);
   const overlap = clamp(Number($("organizerOverlap").value || 1), 0, 5);
   const orgConc = getOrganizerConcurrency();
@@ -1365,7 +2508,7 @@ async function buildWindowPlansConcurrently() {
     });
     const system = "You are a strict JSON-only window organizer.";
     const userText = buildWindowPlanPrompt({ windowPages });
-    const resp = stripCodeFences(await llmCall(plannerCfg, { system, userText, imageDataUrl: null, signal: null }));
+    const resp = stripCodeFences(await llmCallWithRetry(plannerCfg, { system, userText, imageDataUrl: null, signal: null }, { maxRetries }));
     const parsed = safeJsonParse(resp);
     if (!parsed.ok) throw new Error(`Window plan invalid JSON (window pages ${chunk[0]}-${chunk[chunk.length - 1]}).`);
     const out = parsed.value || {};
@@ -1503,6 +2646,7 @@ async function organizeWithLlm() {
   if (!pages.length) throw new Error("No per-page results yet.");
 
   const plannerCfg = getRoleConfig("planner");
+  const { maxRetries } = getRunSettings();
   const windowSize = clamp(Number($("organizerWindow").value || 7), 3, 15);
   const overlap = clamp(Number($("organizerOverlap").value || 1), 0, 5);
   const pageChunks = chunkPages(pages, windowSize, overlap);
@@ -1524,7 +2668,7 @@ async function organizeWithLlm() {
     });
     const system = "You are a strict LaTeX organizer. Output JSON only.";
     const userText = buildOrganizerPrompt({ windowPages });
-    const resp = stripCodeFences(await llmCall(plannerCfg, { system, userText, imageDataUrl: null }));
+    const resp = stripCodeFences(await llmCallWithRetry(plannerCfg, { system, userText, imageDataUrl: null, signal: null }, { maxRetries }));
     const parsed = safeJsonParse(resp);
     if (!parsed.ok) throw new Error(`Organizer LLM returned invalid JSON (window ${ci + 1}).`);
     const out = parsed.value;
@@ -1586,14 +2730,568 @@ async function organizeWithLlm() {
 async function verifyIfEnabled(mainTex) {
   if (!$("verifierEnabled").checked) return { latex_compiles_syntax: null, issues: [] };
   const verifierCfg = getRoleConfig("verifier");
+  const { maxRetries } = getRunSettings();
   setStage("Verify: LLM check");
   const images = flattenImagesList();
   const system = "You are a strict JSON-only verifier.";
   const userText = buildVerifierPrompt({ mainTex, images });
-  const resp = stripCodeFences(await llmCall(verifierCfg, { system, userText, imageDataUrl: null }));
+  const resp = stripCodeFences(await llmCallWithRetry(verifierCfg, { system, userText, imageDataUrl: null, signal: null }, { maxRetries }));
   const parsed = safeJsonParse(resp);
   if (!parsed.ok) throw new Error("Verifier returned invalid JSON.");
   return parsed.value;
+}
+
+// ---------------------------
+// LaTeX Repair (rule-based, handles long text)
+// ---------------------------
+
+const LATEX_REPAIR_RULES = {
+  // 1. 文档结构错误
+  structure: [
+    {
+      name: "chapter_in_article",
+      desc: "ctexart 中不应使用 \\chapter",
+      pattern: /\\chapter\{([^}]*)\}/g,
+      fix: (match, title) => `\\section{${title}}`,
+    },
+    {
+      name: "duplicate_section_markers",
+      desc: "移除重复的章节标记",
+      pattern: /(\\section\{[^}]+\}\s*)\1+/g,
+      fix: (match, single) => single,
+    },
+  ],
+
+  // 2. 目录与正文混淆
+  toc: [
+    {
+      name: "toc_section_commands",
+      desc: "目录页的章节命令降级为文本",
+      // 匹配看起来像目录的内容（连续多个带页码的行）
+      pattern: /(%+\s*目录|\\tableofcontents)[\s\S]*?(?=\\section|\\chapter|$)/gi,
+      fix: (match) => {
+        // 将目录区域内的 \section 等替换为普通文本
+        return match
+          .replace(/\\chapter\{([^}]*)\}/g, "\\textbf{$1}")
+          .replace(/\\section\{([^}]*)\}/g, "\\textbf{$1}")
+          .replace(/\\subsection\{([^}]*)\}/g, "$1");
+      },
+    },
+  ],
+
+  // 3. 数学语法/语义错误
+  math: [
+    {
+      name: "phi_as_emptyset",
+      desc: "\\phi 作为空集应改为 \\varnothing",
+      // 只在明显表示空集的上下文中替换（如 = \\phi, \\in \\phi 等）
+      pattern: /([=∈∉⊆⊇]\s*)\\phi(?![a-zA-Z])/g,
+      fix: (match, prefix) => `${prefix}\\varnothing`,
+    },
+    {
+      name: "fullwidth_in_math",
+      desc: "数学环境中的全角符号转半角",
+      pattern: /(\$[^$]*)\uff08([^$]*\$)/g, // 全角括号
+      fix: (match, before, after) => `${before}(${after}`,
+    },
+    {
+      name: "fullwidth_comma_in_math",
+      desc: "数学环境中的全角逗号转半角",
+      pattern: /(\$[^$]*)，([^$]*\$)/g,
+      fix: (match, before, after) => `${before},${after}`,
+    },
+    {
+      name: "unclosed_inline_math",
+      desc: "修复未闭合的行内数学公式",
+      pattern: /\$([^$\n]{1,200}?)(?=\n\n|\n\\|$(?!\$))/g,
+      fix: (match, content) => {
+        // 只有当内容看起来像数学公式时才修复
+        if (/[a-zA-Z0-9+\-=\\^_{}]/.test(content) && !content.includes("$")) {
+          return `$${content}$`;
+        }
+        return match;
+      },
+    },
+    {
+      name: "command_before_chinese",
+      desc: "LaTeX 命令后直接跟中文需要加空格",
+      // 匹配常见的间距/格式命令后直接跟中文字符（没有空格或花括号）
+      // 中文字符范围：\u4e00-\u9fff
+      pattern: /(\\(?:quad|qquad|hspace\{[^}]*\}|vspace\{[^}]*\}|hfill|vfill|noindent|indent|par|newline|linebreak|pagebreak|smallskip|medskip|bigskip|kern[^a-zA-Z]|hskip[^a-zA-Z]))(?=[\u4e00-\u9fff])/g,
+      fix: (match) => `${match} `,
+    },
+    {
+      name: "text_command_before_chinese",
+      desc: "\\text 类命令后直接跟中文需要加空格",
+      pattern: /(\\(?:text|textbf|textit|textrm|textsf|texttt|textsc|emph)\{[^}]*\})(?=[\u4e00-\u9fff])/g,
+      fix: (match) => `${match} `,
+    },
+    {
+      name: "dotfill_before_chinese",
+      desc: "\\dotfill 后跟中文需要加空格",
+      pattern: /(\\dotfill)(?=[\u4e00-\u9fff])/g,
+      fix: (match) => `${match} `,
+    },
+  ],
+
+  // 4. 环境闭合错误
+  environments: [
+    {
+      name: "unclosed_equation",
+      desc: "修复未闭合的 equation 环境",
+      pattern: /\\begin\{equation\}([\s\S]*?)(?=\\begin\{equation\}|\\section|\\chapter|$)/g,
+      fix: (match, content) => {
+        if (!content.includes("\\end{equation}")) {
+          return `\\begin{equation}${content}\\end{equation}\n`;
+        }
+        return match;
+      },
+    },
+    {
+      name: "unclosed_align",
+      desc: "修复未闭合的 align 环境",
+      pattern: /\\begin\{align\*?\}([\s\S]*?)(?=\\begin\{align|\\section|\\chapter|$)/g,
+      fix: (match, content) => {
+        const envName = match.startsWith("\\begin{align*}") ? "align*" : "align";
+        if (!content.includes(`\\end{${envName}}`)) {
+          return `\\begin{${envName}}${content}\\end{${envName}}\n`;
+        }
+        return match;
+      },
+    },
+    {
+      name: "unclosed_figure",
+      desc: "修复未闭合的 figure 环境",
+      pattern: /\\begin\{figure\}([\s\S]*?)(?=\\begin\{figure\}|\\section|\\chapter|$)/g,
+      fix: (match, content) => {
+        if (!content.includes("\\end{figure}")) {
+          return `\\begin{figure}${content}\\end{figure}\n`;
+        }
+        return match;
+      },
+    },
+    {
+      name: "unclosed_table",
+      desc: "修复未闭合的 table 环境",
+      pattern: /\\begin\{table\}([\s\S]*?)(?=\\begin\{table\}|\\section|\\chapter|$)/g,
+      fix: (match, content) => {
+        if (!content.includes("\\end{table}")) {
+          return `\\begin{table}${content}\\end{table}\n`;
+        }
+        return match;
+      },
+    },
+  ],
+
+  // 5. 图表错误
+  figures: [
+    {
+      name: "missing_image_placeholder",
+      desc: "为缺失的图片添加占位符",
+      // 这个规则需要配合 imageList 使用，在 repairLatex 函数中特殊处理
+      pattern: null,
+      fix: null,
+    },
+    {
+      name: "hardcoded_figure_ref",
+      desc: "手写的图号提示添加注释",
+      pattern: /(图\s*\d+[\.\d]*)/g,
+      fix: (match) => `${match}% TODO: 考虑使用 \\ref`,
+    },
+  ],
+
+  // 6. 中文/编码问题
+  encoding: [
+    {
+      name: "fullwidth_period",
+      desc: "全角句号（在非数学环境）保留",
+      // 不做转换，保持中文习惯
+      pattern: null,
+      fix: null,
+    },
+    {
+      name: "mixed_quotes",
+      desc: "统一引号风格",
+      pattern: /"([^""]*)"/g,
+      fix: (match, content) => `"${content}"`,
+    },
+  ],
+
+  // 7. 定理环境结构化（可选）
+  theorems: [
+    {
+      name: "textbf_theorem",
+      desc: "\\textbf{定理} 转换为 theorem 环境",
+      pattern: /\\textbf\{定理\s*(\d*[\.\d]*)\s*\}[：:\s]*([\s\S]*?)(?=\\textbf|\\section|\\subsection|$)/g,
+      fix: (match, num, content) => {
+        const label = num ? `\\label{thm:${num.replace(/\./g, "_")}}` : "";
+        return `\\begin{theorem}${label}\n${content.trim()}\n\\end{theorem}\n`;
+      },
+    },
+    {
+      name: "textbf_definition",
+      desc: "\\textbf{定义} 转换为 definition 环境",
+      pattern: /\\textbf\{定义\s*(\d*[\.\d]*)\s*\}[：:\s]*([\s\S]*?)(?=\\textbf|\\section|\\subsection|$)/g,
+      fix: (match, num, content) => {
+        const label = num ? `\\label{def:${num.replace(/\./g, "_")}}` : "";
+        return `\\begin{definition}${label}\n${content.trim()}\n\\end{definition}\n`;
+      },
+    },
+    {
+      name: "textbf_example",
+      desc: "\\textbf{例} 转换为 example 环境",
+      pattern: /\\textbf\{例\s*(\d*[\.\d]*)\s*\}[：:\s]*([\s\S]*?)(?=\\textbf|\\section|\\subsection|\\begin\{|$)/g,
+      fix: (match, num, content) => {
+        const label = num ? `\\label{ex:${num.replace(/\./g, "_")}}` : "";
+        return `\\begin{example}${label}\n${content.trim()}\n\\end{example}\n`;
+      },
+    },
+  ],
+};
+
+function repairLatexRuleBased(latex, options = {}) {
+  const {
+    enableStructure = true,
+    enableToc = true,
+    enableMath = true,
+    enableEnvironments = true,
+    enableFigures = true,
+    enableEncoding = true,
+    enableTheorems = false, // 默认关闭定理结构化
+    imageList = [],
+  } = options;
+
+  let result = latex;
+  const fixes = [];
+
+  function applyRules(rules, category) {
+    for (const rule of rules) {
+      if (!rule.pattern || !rule.fix) continue;
+      const before = result;
+      result = result.replace(rule.pattern, rule.fix);
+      if (result !== before) {
+        fixes.push({ category, rule: rule.name, desc: rule.desc });
+      }
+    }
+  }
+
+  if (enableStructure) applyRules(LATEX_REPAIR_RULES.structure, "structure");
+  if (enableToc) applyRules(LATEX_REPAIR_RULES.toc, "toc");
+  if (enableMath) applyRules(LATEX_REPAIR_RULES.math, "math");
+  if (enableEnvironments) applyRules(LATEX_REPAIR_RULES.environments, "environments");
+  if (enableEncoding) applyRules(LATEX_REPAIR_RULES.encoding, "encoding");
+  if (enableTheorems) applyRules(LATEX_REPAIR_RULES.theorems, "theorems");
+
+  // 特殊处理：图片缺失检查
+  if (enableFigures && imageList.length > 0) {
+    const imageSet = new Set(imageList.map((img) => img.id || img.filename?.replace(/\.png$/i, "")));
+    const includedImages = [];
+    result.replace(/\\includegraphics(?:\[[^\]]*\])?\{([^}]+)\}/g, (match, filename) => {
+      const id = filename.replace(/\.png$/i, "");
+      includedImages.push(id);
+      return match;
+    });
+    for (const id of includedImages) {
+      if (!imageSet.has(id)) {
+        fixes.push({
+          category: "figures",
+          rule: "missing_image",
+          desc: `图片 ${id} 不在资源列表中`,
+        });
+      }
+    }
+  }
+
+  // 特殊处理：检查环境配对
+  const envBalance = checkEnvironmentBalance(result);
+  if (envBalance.issues.length > 0) {
+    fixes.push(...envBalance.issues.map((issue) => ({
+      category: "environments",
+      rule: "balance_check",
+      desc: issue,
+    })));
+  }
+
+  return { latex: result, fixes };
+}
+
+function checkEnvironmentBalance(latex) {
+  const issues = [];
+  const envStack = [];
+  const envRegex = /\\(begin|end)\{([^}]+)\}/g;
+  let match;
+
+  while ((match = envRegex.exec(latex)) !== null) {
+    const [, type, name] = match;
+    if (type === "begin") {
+      envStack.push({ name, pos: match.index });
+    } else if (type === "end") {
+      if (envStack.length === 0) {
+        issues.push(`多余的 \\end{${name}} (位置 ${match.index})`);
+      } else {
+        const last = envStack.pop();
+        if (last.name !== name) {
+          issues.push(`环境不匹配：\\begin{${last.name}} 与 \\end{${name}}`);
+        }
+      }
+    }
+  }
+
+  for (const unclosed of envStack) {
+    issues.push(`未闭合的 \\begin{${unclosed.name}} (位置 ${unclosed.pos})`);
+  }
+
+  return { issues };
+}
+
+function addTheoremPreamble(latex, template) {
+  // 定理环境现在已经在 buildLatexPreamble 中统一定义
+  // 这个函数保留用于向后兼容，但不再需要额外添加定义
+  return latex;
+}
+
+/**
+ * 验证 LaTeX 文档的可编译性，返回问题列表
+ */
+function validateLatexCompilability(latex, imageList = []) {
+  const issues = [];
+  
+  // 1. 检查文档结构完整性
+  if (!latex.includes("\\documentclass")) {
+    issues.push({ severity: "error", message: "缺少 \\documentclass" });
+  }
+  if (!latex.includes("\\begin{document}")) {
+    issues.push({ severity: "error", message: "缺少 \\begin{document}" });
+  }
+  if (!latex.includes("\\end{document}")) {
+    issues.push({ severity: "error", message: "缺少 \\end{document}" });
+  }
+  
+  // 2. 检查编译器兼容性
+  if (latex.includes("ctexart") || latex.includes("ctexbook")) {
+    if (!latex.includes("% !TEX program = xelatex") && !latex.includes("% !TEX program = lualatex")) {
+      issues.push({ 
+        severity: "warn", 
+        message: "使用 ctexart/ctexbook 需要用 xelatex 编译，不能用 pdflatex" 
+      });
+    }
+  }
+  
+  // 3. 检查环境配对
+  const envBalance = checkEnvironmentBalance(latex);
+  for (const issue of envBalance.issues) {
+    issues.push({ severity: "error", message: issue });
+  }
+  
+  // 4. 检查数学模式配对
+  const dollarCount = (latex.match(/(?<!\\)\$/g) || []).length;
+  if (dollarCount % 2 !== 0) {
+    issues.push({ severity: "error", message: "行内数学公式 $ 符号不配对" });
+  }
+  
+  // 5. 检查常见的 LaTeX 错误
+  if (/\\begin\{equation\}[\s\S]*?\\begin\{equation\}/.test(latex)) {
+    issues.push({ severity: "error", message: "equation 环境不能嵌套" });
+  }
+  if (/\\begin\{align\}[\s\S]*?\\begin\{align\}/.test(latex)) {
+    issues.push({ severity: "error", message: "align 环境不能嵌套" });
+  }
+  
+  // 6. 检查图片引用
+  const imageIds = new Set(imageList.map(img => img.id || img.filename?.replace(/\.png$/i, "")));
+  const includedImages = [];
+  latex.replace(/\\includegraphics(?:\[[^\]]*\])?\{([^}]+)\}/g, (match, filename) => {
+    const id = filename.replace(/\.png$/i, "").replace(/^.*\//, "");
+    includedImages.push(id);
+    return match;
+  });
+  
+  for (const id of includedImages) {
+    if (imageIds.size > 0 && !imageIds.has(id)) {
+      issues.push({ severity: "warn", message: `图片 ${id}.png 不在导出列表中` });
+    }
+  }
+  
+  // 7. 检查特殊字符（可能需要转义）
+  // 注意：% 在 LaTeX 中是注释，如果在正文中出现且不是注释开头，可能是问题
+  const lines = latex.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    // 检查行内是否有未转义的 % （排除行首注释）
+    if (/[^\\]%/.test(line) && !line.trim().startsWith("%")) {
+      // 可能是有意的注释，不报错，只警告
+    }
+    // 检查未转义的 & （在非表格/align环境中）
+    if (/[^\\]&/.test(line) && !/\\begin\{(tabular|array|align|matrix)/.test(latex.slice(0, latex.indexOf(line)))) {
+      // 可能在表格中，跳过
+    }
+  }
+  
+  return issues;
+}
+
+/**
+ * 获取编译建议
+ */
+function getCompilationInstructions(template) {
+  if (template === "ctexart" || template === "ctexbook") {
+    return `
+编译说明：
+1. 本文档使用 ctexart 文档类，包含中文内容
+2. 必须使用 XeLaTeX 或 LuaLaTeX 编译，不能使用 pdfLaTeX
+3. 编译命令: xelatex main.tex
+4. 如果有引用，需要编译两次
+
+推荐工具：
+- TeXLive 或 MiKTeX（完整安装）
+- VSCode + LaTeX Workshop 插件
+- Overleaf（在线，需设置编译器为 XeLaTeX）
+`.trim();
+  }
+  
+  return `
+编译说明：
+1. 本文档使用 article 文档类
+2. 可以使用 pdfLaTeX、XeLaTeX 或 LuaLaTeX 编译
+3. 如果包含中文，建议切换到 ctexart 模板
+4. 编译命令: pdflatex main.tex 或 xelatex main.tex
+
+推荐工具：
+- TeXLive 或 MiKTeX
+- VSCode + LaTeX Workshop 插件
+- Overleaf（在线）
+`.trim();
+}
+
+async function repairLatexWithLlm(latex, options = {}) {
+  const { maxChunkSize = 8000, maxRetries = 3 } = options;
+  const verifierCfg = getRoleConfig("verifier");
+
+  // 对于长文本，分块处理
+  if (latex.length <= maxChunkSize) {
+    return await repairSingleChunk(latex, verifierCfg, maxRetries);
+  }
+
+  // 分块策略：按页面边界分割
+  const chunks = splitByPageBoundaries(latex, maxChunkSize);
+  const repairedChunks = [];
+
+  for (let i = 0; i < chunks.length; i++) {
+    setStage(`LaTeX 修复: 块 ${i + 1}/${chunks.length}`);
+    setPageProgress(`${i + 1} / ${chunks.length}`, i / chunks.length);
+    const repaired = await repairSingleChunk(chunks[i], verifierCfg, maxRetries);
+    repairedChunks.push(repaired);
+  }
+
+  return repairedChunks.join("\n");
+}
+
+function splitByPageBoundaries(latex, maxChunkSize) {
+  const chunks = [];
+  const pagePattern = /%% ===== PAGE \d+ START =====/g;
+  const matches = [...latex.matchAll(pagePattern)];
+
+  if (matches.length === 0) {
+    // 没有页面标记，按大小分割
+    for (let i = 0; i < latex.length; i += maxChunkSize) {
+      chunks.push(latex.slice(i, i + maxChunkSize));
+    }
+    return chunks;
+  }
+
+  let currentChunk = "";
+  let lastEnd = 0;
+
+  for (const match of matches) {
+    const pageStart = match.index;
+    const segment = latex.slice(lastEnd, pageStart);
+
+    if (currentChunk.length + segment.length > maxChunkSize && currentChunk.length > 0) {
+      chunks.push(currentChunk);
+      currentChunk = segment;
+    } else {
+      currentChunk += segment;
+    }
+    lastEnd = pageStart;
+  }
+
+  // 添加最后一段
+  currentChunk += latex.slice(lastEnd);
+  if (currentChunk.length > 0) {
+    chunks.push(currentChunk);
+  }
+
+  return chunks;
+}
+
+async function repairSingleChunk(chunk, cfg, maxRetries) {
+  const system = "你是 LaTeX 修复专家。只输出修复后的 LaTeX 代码，不要解释。";
+  const userText = `请修复以下 LaTeX 代码中的错误（环境未闭合、语法错误、符号错误等），保持内容不变：
+
+\`\`\`latex
+${chunk}
+\`\`\`
+
+只输出修复后的 LaTeX 代码（不要包含 \`\`\`）：`;
+
+  try {
+    const resp = await llmCallWithRetry(cfg, { system, userText, imageDataUrl: null, signal: null }, { maxRetries });
+    return stripCodeFences(resp);
+  } catch (e) {
+    log(`LLM 修复失败，使用原文: ${String(e.message || e).slice(0, 100)}`);
+    return chunk;
+  }
+}
+
+async function runLatexRepair() {
+  if (!state.mainTex) {
+    throw new Error("没有 main.tex 可修复。请先运行组装阶段。");
+  }
+
+  setStage("LaTeX 修复: 规则修复");
+  setPageProgress("—", 0);
+
+  const enableTheorems = $("repairTheoremsEnabled")?.checked || false;
+  const useLlm = $("repairUseLlm")?.checked || false;
+
+  // 1. 规则修复（快速，适合长文本）
+  const ruleResult = repairLatexRuleBased(state.mainTex, {
+    enableTheorems,
+    imageList: flattenImagesList(),
+  });
+
+  log(`规则修复完成，应用了 ${ruleResult.fixes.length} 项修复：`);
+  for (const fix of ruleResult.fixes.slice(0, 20)) {
+    log(`  - [${fix.category}] ${fix.desc}`);
+  }
+  if (ruleResult.fixes.length > 20) {
+    log(`  ... 还有 ${ruleResult.fixes.length - 20} 项`);
+  }
+
+  let finalLatex = ruleResult.latex;
+
+  // 2. 添加必要的 preamble（如定理环境）
+  if (enableTheorems) {
+    finalLatex = addTheoremPreamble(finalLatex, $("latexTemplate").value);
+  }
+
+  // 3. 可选：LLM 深度修复
+  if (useLlm) {
+    setStage("LaTeX 修复: LLM 深度修复");
+    const { maxRetries } = getRunSettings();
+    finalLatex = await repairLatexWithLlm(finalLatex, { maxRetries });
+    log("LLM 深度修复完成。");
+  }
+
+  // 4. 更新状态
+  state.mainTex = finalLatex;
+  updateOutputsPanels();
+
+  setStage("LaTeX 修复: 完成");
+  setPageProgress("100%", 1);
+  log("LaTeX 修复全部完成。");
+
+  return { fixes: ruleResult.fixes, latex: finalLatex };
 }
 
 // ---------------------------
@@ -1658,13 +3356,63 @@ async function exportZip() {
   if (!window.JSZip) throw new Error("JSZip missing.");
   if (!state.mainTex) throw new Error("No main.tex generated yet. Run organization first.");
 
-  setStage("Export: preparing ZIP");
+  setStage("Export: validating");
   setPageProgress("—", 0);
 
+  // 验证 LaTeX 可编译性
+  const imageList = flattenImagesList();
+  const validationIssues = validateLatexCompilability(state.mainTex, imageList);
+  
+  if (validationIssues.length > 0) {
+    log("LaTeX 验证发现以下问题：");
+    for (const issue of validationIssues) {
+      log(`  [${issue.severity}] ${issue.message}`);
+    }
+    const errorCount = validationIssues.filter(i => i.severity === "error").length;
+    if (errorCount > 0) {
+      log(`警告: 有 ${errorCount} 个错误，编译可能失败。建议先运行 LaTeX 修复。`);
+    }
+  } else {
+    log("LaTeX 验证通过，无明显问题。");
+  }
+
+  setStage("Export: preparing ZIP");
   const zip = new window.JSZip();
+  
+  // main.tex
   zip.file("main.tex", state.mainTex);
+  
+  // 编译说明 README
+  const template = $("latexTemplate").value;
+  const compilationInstructions = getCompilationInstructions(template);
+  const readmeContent = `# LaTeX 导出包
+
+## 文件说明
+
+- main.tex: 主 LaTeX 文档
+- *.png: 从 PDF 中裁剪的图片
+- pages/: 每页的原始转写数据 (JSON)
+- section_tree.json: 章节结构树
+- images.json: 图片资源清单
+
+## ${compilationInstructions}
+
+## 验证结果
+
+${validationIssues.length === 0 ? "✅ 无明显问题" : validationIssues.map(i => `- [${i.severity}] ${i.message}`).join("\n")}
+
+## 生成信息
+
+- 生成时间: ${nowIso()}
+- 源 PDF: ${state.pdfFile?.name || "unknown"}
+- 页数: ${state.pageResults.size}
+- 图片数: ${imageList.length}
+`;
+  zip.file("README.md", readmeContent);
+  
+  // 其他数据文件
   zip.file("section_tree.json", JSON.stringify(state.sectionTree || {}, null, 2));
-  zip.file("images.json", JSON.stringify(flattenImagesList(), null, 2));
+  zip.file("images.json", JSON.stringify(imageList, null, 2));
 
   const pagesFolder = zip.folder("pages");
   const pagesArr = Array.from(state.pageResults.values()).sort((a, b) => a.page - b.page);
@@ -1677,7 +3425,7 @@ async function exportZip() {
   const imgs = Array.from(state.images.values()).sort((a, b) => (a.page - b.page) || a.id.localeCompare(b.id));
   for (let i = 0; i < imgs.length; i++) {
     const img = imgs[i];
-    setPageProgress(`${i + 1} / ${imgs.length}`, imgs.length ? i / imgs.length : 1);
+    setPageProgress(`图片 ${i + 1} / ${imgs.length}`, imgs.length ? i / imgs.length : 1);
     zip.file(img.filename, img.blob);
   }
 
@@ -1747,7 +3495,7 @@ async function exportWorkRecordZip() {
   const imgs = Array.from(state.images.values()).sort((a, b) => (a.page - b.page) || a.id.localeCompare(b.id));
 
   const record = {
-    version: 1,
+    version: 2, // 升级版本号，包含更多字段
     created_at: nowIso(),
     pdf: {
       name: state.pdfFile ? state.pdfFile.name : null,
@@ -1764,19 +3512,45 @@ async function exportWorkRecordZip() {
       referenced_in: img.referencedIn,
       evidence: img.evidence || "",
     })),
+    // 记录各阶段完成状态
+    stages: {
+      transcribe_done: pagesArr.length > 0,
+      window_assemble_done: state.windowPlans && state.windowPlans.length > 0,
+      organize_done: !!state.mainTex,
+      section_tree_done: !!state.sectionTree,
+    },
   };
   zip.file("work_record.json", JSON.stringify(record, null, 2));
 
+  // 保存每页 JSON
   const pagesFolder = zip.folder("pages");
   for (const p of pagesArr) {
     pagesFolder.file(`page_${pad3(p.page)}.json`, JSON.stringify(p.raw || p, null, 2));
   }
 
+  // 保存图片
   for (let i = 0; i < imgs.length; i++) {
-    setPageProgress(`${i + 1} / ${imgs.length}`, imgs.length ? i / imgs.length : 1);
+    setPageProgress(`图片 ${i + 1} / ${imgs.length}`, imgs.length ? i / imgs.length : 1);
     zip.file(imgs[i].filename, imgs[i].blob);
   }
 
+  // 保存后期阶段产物
+  if (state.windowPlans && state.windowPlans.length > 0) {
+    zip.file("window_plans.json", JSON.stringify(state.windowPlans, null, 2));
+    log("导出包含 window_plans.json");
+  }
+
+  if (state.sectionTree) {
+    zip.file("section_tree.json", JSON.stringify(state.sectionTree, null, 2));
+    log("导出包含 section_tree.json");
+  }
+
+  if (state.mainTex) {
+    zip.file("main.tex", state.mainTex);
+    log("导出包含 main.tex");
+  }
+
+  setStage("Export: generating…");
   const blob = await zip.generateAsync({ type: "blob" }, (meta) => {
     if (meta && typeof meta.percent === "number") {
       setPageProgress(`${meta.percent.toFixed(0)}%`, meta.percent / 100);
@@ -1790,7 +3564,7 @@ async function exportWorkRecordZip() {
   a.click();
   setStage("Export: work record done");
   setPageProgress("100%", 1);
-  log("Work record ZIP downloaded.");
+  log(`工作记录已导出: ${pagesArr.length} 页, ${imgs.length} 图片`);
 }
 
 async function importWorkRecordZip() {
@@ -1799,21 +3573,49 @@ async function importWorkRecordZip() {
   if (!file) throw new Error("Please choose a work record ZIP.");
   if (!state.pdfBytes) throw new Error("Load the PDF first, then import the work record.");
 
+  // 检查是否需要先清空现有数据
+  const clearFirst = document.getElementById("importClearFirst")?.checked ?? true;
+
   setStage("Import: work record");
   setPageProgress("—", 0);
   const buf = await file.arrayBuffer();
   const zip = await window.JSZip.loadAsync(buf);
-  const recordText = await zip.file("work_record.json").async("string");
+  
+  const recordFile = zip.file("work_record.json");
+  if (!recordFile) throw new Error("ZIP 中没有找到 work_record.json");
+  
+  const recordText = await recordFile.async("string");
   const parsed = safeJsonParse(recordText);
   if (!parsed.ok) throw new Error("Invalid work_record.json in ZIP.");
   const record = parsed.value;
+  
+  // 检查 PDF 指纹匹配
   if (!record.pdf || record.pdf.sha256 !== state.pdfSha256) {
-    throw new Error("Work record PDF fingerprint does not match the currently loaded PDF.");
+    const msg = `工作记录的 PDF 指纹不匹配！\n` +
+      `记录中的 PDF: ${record.pdf?.name || "unknown"} (SHA256: ${record.pdf?.sha256?.slice(0, 16)}...)\n` +
+      `当前加载的 PDF: ${state.pdfFile?.name || "unknown"} (SHA256: ${state.pdfSha256?.slice(0, 16)}...)`;
+    throw new Error(msg);
   }
 
+  // 如果选择清空，则先清除现有数据（保留 PDF 相关信息）
+  if (clearFirst) {
+    log("清空现有数据后导入...");
+    state.pageResults.clear();
+    state.images.clear();
+    state.sectionTree = null;
+    state.mainTex = "";
+    state.windowPlans = [];
+  }
+
+  let pagesLoaded = 0;
+  let pagesSkipped = 0;
+  let imagesLoaded = 0;
+
   // Load page JSONs
+  setStage("Import: loading pages");
   const pageFiles = Object.keys(zip.files).filter((p) => p.startsWith("pages/") && p.endsWith(".json"));
   for (let i = 0; i < pageFiles.length; i++) {
+    setPageProgress(`页面 ${i + 1} / ${pageFiles.length}`, i / pageFiles.length);
     const path = pageFiles[i];
     const txt = await zip.file(path).async("string");
     const pj = safeJsonParse(txt);
@@ -1821,46 +3623,91 @@ async function importWorkRecordZip() {
     const obj = pj.value;
     const pageNum = Number(obj.page || obj.raw?.page);
     if (!Number.isFinite(pageNum)) continue;
-    if (state.pageResults.has(pageNum)) continue;
-    const latex = typeof obj.latex === "string" ? obj.latex : (obj.raw && typeof obj.raw.latex === "string" ? obj.raw.latex : "");
+    
+    // 允许覆盖已存在的页面数据（如果工作记录中的数据更完整）
+    const existing = state.pageResults.get(pageNum);
+    const newLatex = typeof obj.latex === "string" ? obj.latex : (obj.raw && typeof obj.raw.latex === "string" ? obj.raw.latex : "");
+    
+    // 如果已存在且新数据不比旧数据更完整，则跳过
+    if (existing && existing.latex && !newLatex) {
+      pagesSkipped++;
+      continue;
+    }
+    
     const annotations = obj.annotations || (obj.raw ? obj.raw.annotations : null) || { headings: [], notes: [] };
     const figures = obj.figures || (obj.raw ? obj.raw.figures : null) || [];
     state.pageResults.set(pageNum, {
       page: pageNum,
-      width: obj.width || 0,
-      height: obj.height || 0,
-      latex,
+      width: obj.width || (obj.raw ? obj.raw.width : 0) || 0,
+      height: obj.height || (obj.raw ? obj.raw.height : 0) || 0,
+      latex: newLatex,
       annotations,
       figures,
       raw: obj.raw || obj,
     });
+    pagesLoaded++;
   }
 
   // Load PNGs (top-level)
+  setStage("Import: loading images");
   const pngFiles = Object.keys(zip.files).filter((p) => p.endsWith(".png") && !p.includes("/"));
   for (let i = 0; i < pngFiles.length; i++) {
+    setPageProgress(`图片 ${i + 1} / ${pngFiles.length}`, i / pngFiles.length);
     const name = pngFiles[i];
     const blob = await zip.file(name).async("blob");
     const id = name.replace(/\.png$/i, "");
-    if (!state.images.has(id)) {
-      const meta = (record.images || []).find((x) => x && x.id === id);
-      state.images.set(id, {
-        id,
-        filename: name,
-        page: meta ? meta.page : 0,
-        bbox: meta ? meta.bbox : null,
-        blob,
-        referencedIn: meta ? (meta.referenced_in || []) : [],
-        evidence: meta ? (meta.evidence || "") : "",
-      });
+    // 覆盖已存在的图片
+    const meta = (record.images || []).find((x) => x && x.id === id);
+    state.images.set(id, {
+      id,
+      filename: name,
+      page: meta ? meta.page : 0,
+      bbox: meta ? meta.bbox : null,
+      blob,
+      referencedIn: meta ? (meta.referenced_in || []) : [],
+      evidence: meta ? (meta.evidence || "") : "",
+    });
+    imagesLoaded++;
+  }
+
+  // 加载后期阶段产物
+  setStage("Import: loading artifacts");
+
+  // 加载 window_plans.json
+  const windowPlansFile = zip.file("window_plans.json");
+  if (windowPlansFile) {
+    const wpText = await windowPlansFile.async("string");
+    const wpParsed = safeJsonParse(wpText);
+    if (wpParsed.ok && Array.isArray(wpParsed.value)) {
+      state.windowPlans = wpParsed.value;
+      log(`导入 window_plans: ${state.windowPlans.length} 个窗口`);
     }
+  }
+
+  // 加载 section_tree.json
+  const sectionTreeFile = zip.file("section_tree.json");
+  if (sectionTreeFile) {
+    const stText = await sectionTreeFile.async("string");
+    const stParsed = safeJsonParse(stText);
+    if (stParsed.ok && stParsed.value) {
+      state.sectionTree = stParsed.value;
+      log("导入 section_tree.json");
+    }
+  }
+
+  // 加载 main.tex
+  const mainTexFile = zip.file("main.tex");
+  if (mainTexFile) {
+    state.mainTex = await mainTexFile.async("string");
+    log(`导入 main.tex: ${state.mainTex.length} 字符`);
   }
 
   state.run.lastRange = record.range || state.run.lastRange;
   updateOutputsPanels();
   setStage("Import: done");
   setPageProgress("100%", 1);
-  log(`Imported work record: pages=${state.pageResults.size}, images=${state.images.size}`);
+  log(`工作记录导入完成: 加载 ${pagesLoaded} 页 (跳过 ${pagesSkipped}), ${imagesLoaded} 图片`);
+  log(`当前状态: pages=${state.pageResults.size}, images=${state.images.size}, mainTex=${state.mainTex ? "有" : "无"}`);
 }
 
 // ---------------------------
@@ -1932,6 +3779,10 @@ function wireUi() {
   $("langEnBtn").addEventListener("click", () => setLang("en"));
   $("themeLightBtn").addEventListener("click", () => setTheme("light"));
   $("themeDarkBtn").addEventListener("click", () => setTheme("dark"));
+  
+  // 配置导入/导出按钮
+  $("exportConfigBtn").addEventListener("click", () => exportConfigToFile());
+  $("importConfigBtn").addEventListener("click", () => importConfigFromFile());
 
   // Provider defaults (only fill when fields are empty)
   $("globalProvider").addEventListener("change", () => applyProviderDefaultsTo("global"));
@@ -2014,6 +3865,26 @@ function wireUi() {
     } catch (e) {
       log(String(e && e.message ? e.message : e));
       setStage("Error");
+    } finally {
+      setUiBusy(false);
+    }
+  });
+
+  $("repairBtn").addEventListener("click", async () => {
+    setUiBusy(true);
+    try {
+      const result = await runLatexRepair();
+      const statusEl = document.getElementById("repairStatus");
+      if (statusEl) {
+        setPill(statusEl, "ok", `修复 ${result.fixes.length} 项`);
+      }
+    } catch (e) {
+      log(String(e && e.message ? e.message : e));
+      setStage("Error");
+      const statusEl = document.getElementById("repairStatus");
+      if (statusEl) {
+        setPill(statusEl, "bad", "失败");
+      }
     } finally {
       setUiBusy(false);
     }
@@ -2119,6 +3990,325 @@ function wireUi() {
 
   $("resetBtn").addEventListener("click", () => resetState());
 }
+
+// ---------------------------
+// 配置导出/导入（命令行工具）
+// ---------------------------
+
+/**
+ * 导出所有配置为 JSON 对象
+ * 用法（浏览器控制台）：
+ *   const cfg = exportConfig();
+ *   console.log(JSON.stringify(cfg, null, 2));
+ */
+function exportConfig() {
+  // 安全获取元素值的辅助函数
+  const getVal = (id, defaultVal = "") => {
+    const el = $(id);
+    return el?.value?.trim?.() ?? el?.value ?? defaultVal;
+  };
+  const getNum = (id, defaultVal = 0) => {
+    const el = $(id);
+    const val = Number(el?.value);
+    return Number.isFinite(val) ? val : defaultVal;
+  };
+  const getChecked = (id, defaultVal = false) => {
+    const el = $(id);
+    return el?.checked ?? defaultVal;
+  };
+
+  const config = {
+    _version: 1,
+    _exportedAt: new Date().toISOString(),
+    
+    // 全局 LLM 配置
+    global: {
+      provider: getVal("globalProvider", "openai"),
+      baseUrl: getVal("globalBaseUrl", ""),
+      model: getVal("globalModel", ""),
+      apiKey: getVal("globalKey", ""),
+      temperature: getNum("globalTemp", 0.2),
+      topP: getNum("globalTopP", 1),
+      maxTokens: getNum("globalMaxTokens", 4096),
+      extraHeaders: getVal("globalExtraHeaders", ""),
+    },
+    
+    // 角色配置
+    planner: {
+      useGlobal: getChecked("plannerUseGlobal", true),
+      provider: getVal("plannerProvider", "openai"),
+      baseUrl: getVal("plannerBaseUrl", ""),
+      model: getVal("plannerModel", ""),
+      apiKey: getVal("plannerKey", ""),
+      temperature: getNum("plannerTemp", 0.2),
+      maxTokens: getNum("plannerMaxTokens", 4096),
+    },
+    transcriber: {
+      useGlobal: getChecked("transcriberUseGlobal", true),
+      provider: getVal("transcriberProvider", "openai"),
+      baseUrl: getVal("transcriberBaseUrl", ""),
+      model: getVal("transcriberModel", ""),
+      apiKey: getVal("transcriberKey", ""),
+      temperature: getNum("transcriberTemp", 0.2),
+      maxTokens: getNum("transcriberMaxTokens", 4096),
+    },
+    verifier: {
+      useGlobal: getChecked("verifierUseGlobal", true),
+      enabled: getChecked("verifierEnabled", true),
+      provider: getVal("verifierProvider", "openai"),
+      baseUrl: getVal("verifierBaseUrl", ""),
+      model: getVal("verifierModel", ""),
+      apiKey: getVal("verifierKey", ""),
+      temperature: getNum("verifierTemp", 0.2),
+      maxTokens: getNum("verifierMaxTokens", 4096),
+    },
+    
+    // 运行设置
+    run: {
+      concurrency: getNum("concurrency", 2),
+      maxRetries: getNum("maxRetries", 3),
+      organizeConcurrency: getNum("organizeConcurrency", 2),
+      organizerWindow: getNum("organizerWindow", 7),
+      organizerOverlap: getNum("organizerOverlap", 1),
+    },
+    
+    // 渲染和模板
+    render: {
+      scale: getNum("renderScale", 2),
+      template: getVal("latexTemplate", "ctexart"),
+    },
+    
+    // 图片检测设置
+    imageDetection: {
+      useOcrDetection: getChecked("useOcrDetection", true),
+      useLlmValidation: getChecked("useLlmValidation", true),
+      ocrLanguage: getVal("ocrLanguage", "chi_sim+eng"),
+      maxCropRefine: getNum("maxCropRefine", 3),
+    },
+    
+    // LaTeX 修复设置
+    latexRepair: {
+      repairTheorems: getChecked("repairTheoremsEnabled", false),
+      repairWithLlm: getChecked("repairUseLlm", false),
+    },
+    
+    // 工作记录设置
+    workRecord: {
+      importClearFirst: getChecked("importClearFirst", true),
+    },
+    
+    // UI 设置
+    ui: {
+      theme: typeof currentTheme !== "undefined" ? currentTheme : "light",
+      lang: typeof currentLang !== "undefined" ? currentLang : "zh",
+    },
+  };
+  
+  return config;
+}
+
+/**
+ * 导入配置（尽力导入模式：缺失字段跳过，不影响其他字段）
+ * 用法（浏览器控制台）：
+ *   importConfig({ global: { provider: "openai", ... }, ... });
+ */
+function importConfig(config) {
+  if (!config || typeof config !== "object") {
+    console.error("importConfig: 无效的配置对象");
+    return false;
+  }
+  
+  // 安全设置元素值的辅助函数（元素不存在或设置失败时静默跳过）
+  const setVal = (id, val) => {
+    try {
+      const el = $(id);
+      if (el && val !== undefined) el.value = val;
+    } catch (e) { /* 静默跳过 */ }
+  };
+  const setChecked = (id, val) => {
+    try {
+      const el = $(id);
+      if (el && val !== undefined) el.checked = val;
+    } catch (e) { /* 静默跳过 */ }
+  };
+  
+  let importedCount = 0;
+  let skippedCount = 0;
+  
+  // 全局配置
+  if (config.global) {
+    const g = config.global;
+    setVal("globalProvider", g.provider); importedCount++;
+    setVal("globalBaseUrl", g.baseUrl); importedCount++;
+    setVal("globalModel", g.model); importedCount++;
+    setVal("globalKey", g.apiKey); importedCount++;
+    setVal("globalTemp", g.temperature); importedCount++;
+    setVal("globalTopP", g.topP); importedCount++;
+    setVal("globalMaxTokens", g.maxTokens); importedCount++;
+    setVal("globalExtraHeaders", g.extraHeaders); importedCount++;
+  }
+  
+  // 角色配置
+  const roles = ["planner", "transcriber", "verifier"];
+  for (const role of roles) {
+    if (config[role]) {
+      const r = config[role];
+      setChecked(role + "UseGlobal", r.useGlobal);
+      setVal(role + "Provider", r.provider);
+      setVal(role + "BaseUrl", r.baseUrl);
+      setVal(role + "Model", r.model);
+      setVal(role + "Key", r.apiKey);
+      setVal(role + "Temp", r.temperature);
+      setVal(role + "MaxTokens", r.maxTokens);
+      if (role === "verifier") {
+        setChecked("verifierEnabled", r.enabled);
+      }
+      importedCount++;
+    }
+  }
+  
+  // 运行设置
+  if (config.run) {
+    const r = config.run;
+    setVal("concurrency", r.concurrency);
+    setVal("maxRetries", r.maxRetries);
+    setVal("organizeConcurrency", r.organizeConcurrency);
+    setVal("organizerWindow", r.organizerWindow);
+    setVal("organizerOverlap", r.organizerOverlap);
+    importedCount++;
+  }
+  
+  // 渲染和模板
+  if (config.render) {
+    setVal("renderScale", config.render.scale);
+    // 兼容旧配置的 dpi 字段
+    if (config.render.dpi !== undefined) {
+      setVal("renderScale", config.render.dpi);
+    }
+    setVal("latexTemplate", config.render.template);
+    importedCount++;
+  }
+  
+  // 图片检测设置
+  if (config.imageDetection) {
+    const img = config.imageDetection;
+    setChecked("useOcrDetection", img.useOcrDetection);
+    setChecked("useLlmValidation", img.useLlmValidation);
+    setVal("ocrLanguage", img.ocrLanguage);
+    setVal("maxCropRefine", img.maxCropRefine);
+    importedCount++;
+  }
+  
+  // LaTeX 修复设置
+  if (config.latexRepair) {
+    const lx = config.latexRepair;
+    setChecked("repairTheoremsEnabled", lx.repairTheorems);
+    setChecked("repairUseLlm", lx.repairWithLlm);
+    importedCount++;
+  }
+  
+  // 工作记录设置
+  if (config.workRecord) {
+    setChecked("importClearFirst", config.workRecord.importClearFirst);
+    importedCount++;
+  }
+  
+  // UI 设置
+  if (config.ui) {
+    try {
+      if (config.ui.theme && typeof setTheme === "function") setTheme(config.ui.theme);
+      if (config.ui.lang && typeof setLang === "function") setLang(config.ui.lang);
+      importedCount++;
+    } catch (e) { /* 静默跳过 */ }
+  }
+  
+  console.log(`✅ 配置导入完成（已导入 ${importedCount} 个配置组）`);
+  log("配置已导入");
+  return true;
+}
+
+/**
+ * 导出配置到剪贴板
+ * 用法：exportConfigToClipboard()
+ */
+async function exportConfigToClipboard() {
+  const config = exportConfig();
+  const json = JSON.stringify(config, null, 2);
+  try {
+    await navigator.clipboard.writeText(json);
+    console.log("✅ 配置已复制到剪贴板");
+    log("配置已复制到剪贴板");
+    return true;
+  } catch (e) {
+    console.error("复制到剪贴板失败:", e);
+    console.log("配置 JSON：\n" + json);
+    return false;
+  }
+}
+
+/**
+ * 从剪贴板导入配置
+ * 用法：importConfigFromClipboard()
+ */
+async function importConfigFromClipboard() {
+  try {
+    const text = await navigator.clipboard.readText();
+    const config = JSON.parse(text);
+    return importConfig(config);
+  } catch (e) {
+    console.error("从剪贴板导入失败:", e);
+    return false;
+  }
+}
+
+/**
+ * 导出配置到本地文件
+ * 用法：exportConfigToFile()
+ */
+function exportConfigToFile(filename = "pdf2latex_config.json") {
+  const config = exportConfig();
+  const json = JSON.stringify(config, null, 2);
+  const blob = new Blob([json], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+  console.log("✅ 配置已保存到文件:", filename);
+  log("配置已保存到文件: " + filename);
+}
+
+/**
+ * 从本地文件导入配置（弹出文件选择器）
+ * 用法：importConfigFromFile()
+ */
+function importConfigFromFile() {
+  const input = document.createElement("input");
+  input.type = "file";
+  input.accept = ".json";
+  input.onchange = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const config = JSON.parse(text);
+      importConfig(config);
+    } catch (err) {
+      console.error("导入文件失败:", err);
+      log("导入文件失败: " + (err.message || err));
+    }
+  };
+  input.click();
+}
+
+// 暴露到全局，方便控制台调用（可选）
+window.exportConfig = exportConfig;
+window.importConfig = importConfig;
+window.exportConfigToClipboard = exportConfigToClipboard;
+window.importConfigFromClipboard = importConfigFromClipboard;
+window.exportConfigToFile = exportConfigToFile;
+window.importConfigFromFile = importConfigFromFile;
 
 // ---------------------------
 // Boot
