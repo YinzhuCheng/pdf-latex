@@ -3706,6 +3706,306 @@ function wireUi() {
 }
 
 // ---------------------------
+// 配置导出/导入（命令行工具）
+// ---------------------------
+
+/**
+ * 导出所有配置为 JSON 对象
+ * 用法（浏览器控制台）：
+ *   const cfg = exportConfig();
+ *   console.log(JSON.stringify(cfg, null, 2));
+ */
+function exportConfig() {
+  const config = {
+    _version: 1,
+    _exportedAt: new Date().toISOString(),
+    
+    // 全局 LLM 配置
+    global: {
+      provider: $("globalProvider").value,
+      baseUrl: $("globalBaseUrl").value.trim(),
+      model: $("globalModel").value.trim(),
+      apiKey: $("globalKey").value,
+      temperature: Number($("globalTemp").value),
+      topP: Number($("globalTopP").value),
+      maxTokens: Number($("globalMaxTokens").value),
+      extraHeaders: $("globalExtraHeaders").value.trim(),
+    },
+    
+    // 角色配置
+    planner: {
+      useGlobal: $("plannerUseGlobal").checked,
+      provider: $("plannerProvider").value,
+      baseUrl: $("plannerBaseUrl").value.trim(),
+      model: $("plannerModel").value.trim(),
+      apiKey: $("plannerKey").value,
+      temperature: Number($("plannerTemp").value),
+      maxTokens: Number($("plannerMaxTokens").value),
+    },
+    transcriber: {
+      useGlobal: $("transcriberUseGlobal").checked,
+      provider: $("transcriberProvider").value,
+      baseUrl: $("transcriberBaseUrl").value.trim(),
+      model: $("transcriberModel").value.trim(),
+      apiKey: $("transcriberKey").value,
+      temperature: Number($("transcriberTemp").value),
+      maxTokens: Number($("transcriberMaxTokens").value),
+    },
+    verifier: {
+      useGlobal: $("verifierUseGlobal").checked,
+      enabled: $("verifierEnabled").checked,
+      provider: $("verifierProvider").value,
+      baseUrl: $("verifierBaseUrl").value.trim(),
+      model: $("verifierModel").value.trim(),
+      apiKey: $("verifierKey").value,
+      temperature: Number($("verifierTemp").value),
+      maxTokens: Number($("verifierMaxTokens").value),
+    },
+    
+    // 运行设置
+    run: {
+      concurrency: Number($("concurrency").value),
+      maxRetries: Number($("maxRetries").value),
+      organizeConcurrency: Number($("organizeConcurrency").value),
+      organizerWindow: Number($("organizerWindow").value),
+      organizerOverlap: Number($("organizerOverlap").value),
+    },
+    
+    // 渲染和模板
+    render: {
+      dpi: Number($("renderDpi").value),
+      template: $("docTemplate").value,
+    },
+    
+    // 图片检测设置
+    imageDetection: {
+      useOcrDetection: $("useOcrDetection")?.checked ?? true,
+      ocrLanguage: $("ocrLanguage")?.value ?? "chi_sim+eng",
+      maxCropRefine: Number($("maxCropRefine").value),
+    },
+    
+    // LaTeX 修复设置
+    latexRepair: {
+      repairTheorems: $("repairTheorems")?.checked ?? true,
+      repairWithLlm: $("repairWithLlm")?.checked ?? false,
+    },
+    
+    // 工作记录设置
+    workRecord: {
+      importClearFirst: $("importClearFirst")?.checked ?? true,
+    },
+    
+    // UI 设置
+    ui: {
+      theme: currentTheme,
+      lang: currentLang,
+    },
+  };
+  
+  return config;
+}
+
+/**
+ * 导入配置
+ * 用法（浏览器控制台）：
+ *   importConfig({ global: { provider: "openai", ... }, ... });
+ */
+function importConfig(config) {
+  if (!config || typeof config !== "object") {
+    console.error("importConfig: 无效的配置对象");
+    return false;
+  }
+  
+  try {
+    // 全局配置
+    if (config.global) {
+      const g = config.global;
+      if (g.provider) $("globalProvider").value = g.provider;
+      if (g.baseUrl !== undefined) $("globalBaseUrl").value = g.baseUrl;
+      if (g.model) $("globalModel").value = g.model;
+      if (g.apiKey !== undefined) $("globalKey").value = g.apiKey;
+      if (g.temperature !== undefined) $("globalTemp").value = g.temperature;
+      if (g.topP !== undefined) $("globalTopP").value = g.topP;
+      if (g.maxTokens !== undefined) $("globalMaxTokens").value = g.maxTokens;
+      if (g.extraHeaders !== undefined) $("globalExtraHeaders").value = g.extraHeaders;
+    }
+    
+    // 角色配置
+    const roles = ["planner", "transcriber", "verifier"];
+    for (const role of roles) {
+      if (config[role]) {
+        const r = config[role];
+        if (r.useGlobal !== undefined) $(role + "UseGlobal").checked = r.useGlobal;
+        if (r.provider) $(role + "Provider").value = r.provider;
+        if (r.baseUrl !== undefined) $(role + "BaseUrl").value = r.baseUrl;
+        if (r.model) $(role + "Model").value = r.model;
+        if (r.apiKey !== undefined) $(role + "Key").value = r.apiKey;
+        if (r.temperature !== undefined) $(role + "Temp").value = r.temperature;
+        if (r.maxTokens !== undefined) $(role + "MaxTokens").value = r.maxTokens;
+        if (role === "verifier" && r.enabled !== undefined) {
+          $("verifierEnabled").checked = r.enabled;
+        }
+      }
+    }
+    
+    // 运行设置
+    if (config.run) {
+      const r = config.run;
+      if (r.concurrency !== undefined) $("concurrency").value = r.concurrency;
+      if (r.maxRetries !== undefined) $("maxRetries").value = r.maxRetries;
+      if (r.organizeConcurrency !== undefined) $("organizeConcurrency").value = r.organizeConcurrency;
+      if (r.organizerWindow !== undefined) $("organizerWindow").value = r.organizerWindow;
+      if (r.organizerOverlap !== undefined) $("organizerOverlap").value = r.organizerOverlap;
+    }
+    
+    // 渲染和模板
+    if (config.render) {
+      if (config.render.dpi !== undefined) $("renderDpi").value = config.render.dpi;
+      if (config.render.template) $("docTemplate").value = config.render.template;
+    }
+    
+    // 图片检测设置
+    if (config.imageDetection) {
+      const img = config.imageDetection;
+      if (img.useOcrDetection !== undefined && $("useOcrDetection")) {
+        $("useOcrDetection").checked = img.useOcrDetection;
+      }
+      if (img.ocrLanguage && $("ocrLanguage")) {
+        $("ocrLanguage").value = img.ocrLanguage;
+      }
+      if (img.maxCropRefine !== undefined) {
+        $("maxCropRefine").value = img.maxCropRefine;
+      }
+    }
+    
+    // LaTeX 修复设置
+    if (config.latexRepair) {
+      const lx = config.latexRepair;
+      if (lx.repairTheorems !== undefined && $("repairTheorems")) {
+        $("repairTheorems").checked = lx.repairTheorems;
+      }
+      if (lx.repairWithLlm !== undefined && $("repairWithLlm")) {
+        $("repairWithLlm").checked = lx.repairWithLlm;
+      }
+    }
+    
+    // 工作记录设置
+    if (config.workRecord) {
+      if (config.workRecord.importClearFirst !== undefined && $("importClearFirst")) {
+        $("importClearFirst").checked = config.workRecord.importClearFirst;
+      }
+    }
+    
+    // UI 设置
+    if (config.ui) {
+      if (config.ui.theme) setTheme(config.ui.theme);
+      if (config.ui.lang) setLang(config.ui.lang);
+    }
+    
+    console.log("✅ 配置导入成功");
+    log("配置已导入");
+    return true;
+  } catch (e) {
+    console.error("importConfig 失败:", e);
+    return false;
+  }
+}
+
+/**
+ * 导出配置到剪贴板
+ * 用法：exportConfigToClipboard()
+ */
+async function exportConfigToClipboard() {
+  const config = exportConfig();
+  const json = JSON.stringify(config, null, 2);
+  try {
+    await navigator.clipboard.writeText(json);
+    console.log("✅ 配置已复制到剪贴板");
+    log("配置已复制到剪贴板");
+    return true;
+  } catch (e) {
+    console.error("复制到剪贴板失败:", e);
+    console.log("配置 JSON：\n" + json);
+    return false;
+  }
+}
+
+/**
+ * 从剪贴板导入配置
+ * 用法：importConfigFromClipboard()
+ */
+async function importConfigFromClipboard() {
+  try {
+    const text = await navigator.clipboard.readText();
+    const config = JSON.parse(text);
+    return importConfig(config);
+  } catch (e) {
+    console.error("从剪贴板导入失败:", e);
+    return false;
+  }
+}
+
+/**
+ * 导出配置到本地文件
+ * 用法：exportConfigToFile()
+ */
+function exportConfigToFile(filename = "pdf2latex_config.json") {
+  const config = exportConfig();
+  const json = JSON.stringify(config, null, 2);
+  const blob = new Blob([json], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+  console.log("✅ 配置已保存到文件:", filename);
+  log("配置已保存到文件: " + filename);
+}
+
+/**
+ * 从本地文件导入配置（弹出文件选择器）
+ * 用法：importConfigFromFile()
+ */
+function importConfigFromFile() {
+  const input = document.createElement("input");
+  input.type = "file";
+  input.accept = ".json";
+  input.onchange = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const config = JSON.parse(text);
+      importConfig(config);
+    } catch (err) {
+      console.error("导入文件失败:", err);
+      log("导入文件失败: " + (err.message || err));
+    }
+  };
+  input.click();
+}
+
+// 暴露到全局，方便控制台调用
+window.exportConfig = exportConfig;
+window.importConfig = importConfig;
+window.exportConfigToClipboard = exportConfigToClipboard;
+window.importConfigFromClipboard = importConfigFromClipboard;
+window.exportConfigToFile = exportConfigToFile;
+window.importConfigFromFile = importConfigFromFile;
+
+// 打印帮助信息
+console.log(`
+📋 PDF2LaTeX 配置命令行工具：
+  exportConfig()              - 获取配置对象
+  importConfig(cfg)           - 导入配置对象
+  exportConfigToClipboard()   - 复制配置到剪贴板
+  importConfigFromClipboard() - 从剪贴板导入配置
+  exportConfigToFile()        - 保存配置到文件
+  importConfigFromFile()      - 从文件导入配置
+`);
+
+// ---------------------------
 // Boot
 // ---------------------------
 
