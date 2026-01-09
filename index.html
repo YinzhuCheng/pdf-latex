@@ -1,0 +1,408 @@
+<!doctype html>
+<html lang="zh-Hans">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PDF → LaTeX（LLM-only）</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="topbar__left">
+        <div class="brand">
+          <div class="brand__title" id="appTitle">PDF → LaTeX（LLM-only）</div>
+          <div class="brand__subtitle" id="appSubtitle">
+            扫描版数学教材：按页转写 + 剪裁出图 + 章节组织（仅用大模型 API）
+          </div>
+        </div>
+      </div>
+      <div class="topbar__right">
+        <div class="segmented" role="group" aria-label="Language">
+          <button class="segmented__btn" id="langZhBtn" type="button">中文</button>
+          <button class="segmented__btn" id="langEnBtn" type="button">EN</button>
+        </div>
+        <div class="segmented" role="group" aria-label="Theme">
+          <button class="segmented__btn" id="themeLightBtn" type="button">Light</button>
+          <button class="segmented__btn" id="themeDarkBtn" type="button">Dark</button>
+        </div>
+      </div>
+    </header>
+
+    <main class="container">
+      <section class="card">
+        <div class="card__header">
+          <div class="card__title" id="secInputTitle">输入</div>
+          <div class="card__desc" id="secInputDesc">仅处理你指定的页码范围（超出范围不处理）。</div>
+        </div>
+
+        <div class="grid grid--3">
+          <div class="field">
+            <label class="field__label" for="pdfFile" id="lblPdf">PDF 文件</label>
+            <input class="field__input" id="pdfFile" type="file" accept="application/pdf" />
+            <div class="field__hint" id="hintPdf">
+              本工具不会做任何专用 OCR/PDF 文档分析；仅将每页渲染为图片并交给 LLM 转写。
+            </div>
+          </div>
+
+          <div class="field">
+            <label class="field__label" id="lblPages">页码范围（含首尾）</label>
+            <div class="inline">
+              <input class="field__input" id="pageStart" type="number" min="1" step="1" placeholder="start" />
+              <span class="inline__sep">—</span>
+              <input class="field__input" id="pageEnd" type="number" min="1" step="1" placeholder="end" />
+            </div>
+            <div class="field__hint" id="hintPages">加载 PDF 后会显示总页数。</div>
+          </div>
+
+          <div class="field">
+            <label class="field__label" id="lblRender">渲染倍率</label>
+            <div class="inline">
+              <input class="field__input" id="renderScale" type="number" min="1" max="5" step="0.25" value="2" />
+              <button class="btn btn--ghost" id="renderPreviewBtn" type="button">预览一页</button>
+            </div>
+            <div class="field__hint" id="hintRender">
+              值越大越清晰但更慢；建议 1.5–2.5。
+            </div>
+          </div>
+        </div>
+
+        <div class="grid grid--3">
+          <div class="field">
+            <label class="field__label" id="lblTemplate">LaTeX 模板</label>
+            <select class="field__input" id="latexTemplate">
+              <option value="ctexart">ctexart（推荐：含中文）</option>
+              <option value="article">article（更通用）</option>
+            </select>
+            <div class="field__hint" id="hintTemplate">影响导出的 `main.tex` 头部。</div>
+          </div>
+
+          <div class="field">
+            <label class="field__label" id="lblOrganizerMode">章节组织</label>
+            <select class="field__input" id="organizerMode">
+              <option value="deterministic">确定性（仅显式证据）</option>
+              <option value="llm">LLM（仍需显式证据校验）</option>
+            </select>
+            <div class="field__hint" id="hintOrganizerMode">
+              “先转写后组织”：先按页产出，再做跨页组织（含滑动窗口）。
+            </div>
+          </div>
+
+          <div class="field">
+            <label class="field__label" id="lblWindow">跨页窗口</label>
+            <div class="inline">
+              <input class="field__input" id="organizerWindow" type="number" min="3" max="15" step="1" value="7" />
+              <input class="field__input" id="organizerOverlap" type="number" min="0" max="5" step="1" value="1" />
+            </div>
+            <div class="field__hint" id="hintWindow">窗口大小 / 重叠页数（仅在 LLM 组织时使用）。</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card__header">
+          <div class="card__title" id="secLlmTitle">大模型设置（统一入口 + 多角色）</div>
+          <div class="card__desc" id="secLlmDesc">
+            允许为规划/转写/后校验分别配置不同的 key/url/model，并提供连通性测试。
+          </div>
+        </div>
+
+        <details class="details" open>
+          <summary class="details__summary" id="sumGlobal">全局默认（可被角色覆盖）</summary>
+          <div class="grid grid--3">
+            <div class="field">
+              <label class="field__label" id="lblGlobalProvider">协议</label>
+              <select class="field__input" id="globalProvider">
+                <option value="openai">OpenAI</option>
+                <option value="gemini">Gemini</option>
+                <option value="claude">Claude</option>
+              </select>
+            </div>
+            <div class="field">
+              <label class="field__label" id="lblGlobalBaseUrl">Base URL</label>
+              <input class="field__input" id="globalBaseUrl" type="text" placeholder="https://api.openai.com" />
+              <div class="field__hint" id="hintBaseUrl">
+                浏览器直连常见会遇到 CORS；建议使用你自己的 Cloudflare Worker 代理（README 有示例）。
+              </div>
+            </div>
+            <div class="field">
+              <label class="field__label" id="lblGlobalModel">Model</label>
+              <input class="field__input" id="globalModel" type="text" placeholder="gpt-4o-mini / gemini-1.5-pro / claude-3.5-sonnet" />
+            </div>
+          </div>
+          <div class="grid grid--3">
+            <div class="field">
+              <label class="field__label" id="lblGlobalKey">API Key</label>
+              <div class="inline">
+                <input class="field__input" id="globalKey" type="password" placeholder="••••••••••" autocomplete="off" />
+                <button class="btn btn--ghost" id="globalKeyToggle" type="button">显示</button>
+              </div>
+              <div class="field__hint" id="hintKey">默认不落盘保存。</div>
+            </div>
+            <div class="field">
+              <label class="field__label" id="lblGlobalTemp">Temperature</label>
+              <input class="field__input" id="globalTemp" type="number" min="0" max="2" step="0.05" value="0.2" />
+            </div>
+            <div class="field">
+              <label class="field__label" id="lblGlobalTopP">Top-p</label>
+              <input class="field__input" id="globalTopP" type="number" min="0" max="1" step="0.01" value="0.95" />
+            </div>
+          </div>
+          <div class="grid grid--3">
+            <div class="field">
+              <label class="field__label" id="lblGlobalMaxTokens">Max tokens</label>
+              <input class="field__input" id="globalMaxTokens" type="number" min="64" step="64" value="2048" />
+            </div>
+            <div class="field">
+              <label class="field__label" id="lblGlobalExtraHeaders">额外 Headers（JSON）</label>
+              <input class="field__input" id="globalExtraHeaders" type="text" placeholder='{"x-my-header":"..."}' />
+            </div>
+            <div class="field">
+              <label class="field__label" id="lblGlobalConn">连通性测试</label>
+              <div class="inline">
+                <button class="btn btn--ghost" id="globalConnTestBtn" type="button">测试</button>
+                <div class="pill" id="globalConnStatus">—</div>
+              </div>
+            </div>
+          </div>
+        </details>
+
+        <div class="divider"></div>
+
+        <div class="roles">
+          <div class="roles__head">
+            <div class="roles__title" id="rolesTitle">角色配置</div>
+            <div class="roles__hint" id="rolesHint">
+              转写阶段使用“转写 LLM”；章节组织可选确定性或“规划 LLM”；可选用“后校验 LLM”做语法/一致性检查。
+            </div>
+          </div>
+
+          <div class="role" data-role="planner">
+            <div class="role__header">
+              <div class="role__name" id="rolePlanner">规划 LLM</div>
+              <div class="inline">
+                <label class="toggle">
+                  <input id="plannerUseGlobal" type="checkbox" checked />
+                  <span class="toggle__label" id="lblUseGlobal1">使用全局</span>
+                </label>
+                <button class="btn btn--ghost" id="plannerConnTestBtn" type="button">测试</button>
+                <div class="pill" id="plannerConnStatus">—</div>
+              </div>
+            </div>
+            <div class="grid grid--3 role__grid">
+              <div class="field">
+                <label class="field__label" id="lblPlannerProvider">协议</label>
+                <select class="field__input" id="plannerProvider">
+                  <option value="openai">OpenAI</option>
+                  <option value="gemini">Gemini</option>
+                  <option value="claude">Claude</option>
+                </select>
+              </div>
+              <div class="field">
+                <label class="field__label" id="lblPlannerBaseUrl">Base URL</label>
+                <input class="field__input" id="plannerBaseUrl" type="text" />
+              </div>
+              <div class="field">
+                <label class="field__label" id="lblPlannerModel">Model</label>
+                <input class="field__input" id="plannerModel" type="text" />
+              </div>
+              <div class="field">
+                <label class="field__label" id="lblPlannerKey">API Key</label>
+                <div class="inline">
+                  <input class="field__input" id="plannerKey" type="password" autocomplete="off" />
+                  <button class="btn btn--ghost" id="plannerKeyToggle" type="button">显示</button>
+                </div>
+              </div>
+              <div class="field">
+                <label class="field__label" id="lblPlannerTemp">Temperature</label>
+                <input class="field__input" id="plannerTemp" type="number" min="0" max="2" step="0.05" />
+              </div>
+              <div class="field">
+                <label class="field__label" id="lblPlannerMaxTokens">Max tokens</label>
+                <input class="field__input" id="plannerMaxTokens" type="number" min="64" step="64" />
+              </div>
+            </div>
+          </div>
+
+          <div class="role" data-role="transcriber">
+            <div class="role__header">
+              <div class="role__name" id="roleTranscriber">转写 LLM（必需）</div>
+              <div class="inline">
+                <label class="toggle">
+                  <input id="transcriberUseGlobal" type="checkbox" checked />
+                  <span class="toggle__label" id="lblUseGlobal2">使用全局</span>
+                </label>
+                <button class="btn btn--ghost" id="transcriberConnTestBtn" type="button">测试</button>
+                <div class="pill" id="transcriberConnStatus">—</div>
+              </div>
+            </div>
+            <div class="grid grid--3 role__grid">
+              <div class="field">
+                <label class="field__label" id="lblTranscriberProvider">协议</label>
+                <select class="field__input" id="transcriberProvider">
+                  <option value="openai">OpenAI</option>
+                  <option value="gemini">Gemini</option>
+                  <option value="claude">Claude</option>
+                </select>
+              </div>
+              <div class="field">
+                <label class="field__label" id="lblTranscriberBaseUrl">Base URL</label>
+                <input class="field__input" id="transcriberBaseUrl" type="text" />
+              </div>
+              <div class="field">
+                <label class="field__label" id="lblTranscriberModel">Model</label>
+                <input class="field__input" id="transcriberModel" type="text" />
+              </div>
+              <div class="field">
+                <label class="field__label" id="lblTranscriberKey">API Key</label>
+                <div class="inline">
+                  <input class="field__input" id="transcriberKey" type="password" autocomplete="off" />
+                  <button class="btn btn--ghost" id="transcriberKeyToggle" type="button">显示</button>
+                </div>
+              </div>
+              <div class="field">
+                <label class="field__label" id="lblTranscriberTemp">Temperature</label>
+                <input class="field__input" id="transcriberTemp" type="number" min="0" max="2" step="0.05" />
+              </div>
+              <div class="field">
+                <label class="field__label" id="lblTranscriberMaxTokens">Max tokens</label>
+                <input class="field__input" id="transcriberMaxTokens" type="number" min="64" step="64" />
+              </div>
+            </div>
+          </div>
+
+          <div class="role" data-role="verifier">
+            <div class="role__header">
+              <div class="role__name" id="roleVerifier">后校验 LLM（可选）</div>
+              <div class="inline">
+                <label class="toggle">
+                  <input id="verifierEnabled" type="checkbox" />
+                  <span class="toggle__label" id="lblEnabled">启用</span>
+                </label>
+                <label class="toggle">
+                  <input id="verifierUseGlobal" type="checkbox" checked />
+                  <span class="toggle__label" id="lblUseGlobal3">使用全局</span>
+                </label>
+                <button class="btn btn--ghost" id="verifierConnTestBtn" type="button">测试</button>
+                <div class="pill" id="verifierConnStatus">—</div>
+              </div>
+            </div>
+            <div class="grid grid--3 role__grid">
+              <div class="field">
+                <label class="field__label" id="lblVerifierProvider">协议</label>
+                <select class="field__input" id="verifierProvider">
+                  <option value="openai">OpenAI</option>
+                  <option value="gemini">Gemini</option>
+                  <option value="claude">Claude</option>
+                </select>
+              </div>
+              <div class="field">
+                <label class="field__label" id="lblVerifierBaseUrl">Base URL</label>
+                <input class="field__input" id="verifierBaseUrl" type="text" />
+              </div>
+              <div class="field">
+                <label class="field__label" id="lblVerifierModel">Model</label>
+                <input class="field__input" id="verifierModel" type="text" />
+              </div>
+              <div class="field">
+                <label class="field__label" id="lblVerifierKey">API Key</label>
+                <div class="inline">
+                  <input class="field__input" id="verifierKey" type="password" autocomplete="off" />
+                  <button class="btn btn--ghost" id="verifierKeyToggle" type="button">显示</button>
+                </div>
+              </div>
+              <div class="field">
+                <label class="field__label" id="lblVerifierTemp">Temperature</label>
+                <input class="field__input" id="verifierTemp" type="number" min="0" max="2" step="0.05" />
+              </div>
+              <div class="field">
+                <label class="field__label" id="lblVerifierMaxTokens">Max tokens</label>
+                <input class="field__input" id="verifierMaxTokens" type="number" min="64" step="64" />
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card__header">
+          <div class="card__title" id="secRunTitle">运行</div>
+          <div class="card__desc" id="secRunDesc">按阶段执行，运行时显示进度与日志。</div>
+        </div>
+
+        <div class="actions">
+          <button class="btn btn--primary" id="loadPdfBtn" type="button">加载 PDF</button>
+          <button class="btn btn--primary" id="transcribeBtn" type="button">1) 按页转写 + 剪裁出图</button>
+          <button class="btn btn--primary" id="organizeBtn" type="button">2) 章节组织 + 生成 main.tex</button>
+          <button class="btn btn--primary" id="exportBtn" type="button">3) 导出 ZIP</button>
+          <button class="btn" id="resetBtn" type="button">重置</button>
+        </div>
+
+        <div class="progress">
+          <div class="progress__row">
+            <div class="progress__label" id="lblStage">阶段</div>
+            <div class="progress__value" id="stageValue">—</div>
+          </div>
+          <div class="progress__row">
+            <div class="progress__label" id="lblPageProgress">页进度</div>
+            <div class="progress__value" id="pageValue">—</div>
+          </div>
+          <div class="bar">
+            <div class="bar__fill" id="barFill" style="width: 0%"></div>
+          </div>
+        </div>
+
+        <div class="grid grid--2">
+          <div class="preview">
+            <div class="preview__title" id="previewTitle">页面预览</div>
+            <canvas id="previewCanvas" class="preview__canvas"></canvas>
+          </div>
+          <div class="log">
+            <div class="log__title" id="logTitle">日志</div>
+            <pre class="log__box" id="logBox"></pre>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card__header">
+          <div class="card__title" id="secOutTitle">输出</div>
+          <div class="card__desc" id="secOutDesc">章节树 / main.tex / 图像资源清单 / 每页 JSON。</div>
+        </div>
+
+        <div class="tabs">
+          <div class="tabs__bar">
+            <button class="tabs__btn" type="button" data-tab="tree" id="tabTree">章节树</button>
+            <button class="tabs__btn" type="button" data-tab="tex" id="tabTex">main.tex</button>
+            <button class="tabs__btn" type="button" data-tab="images" id="tabImages">图像资源</button>
+            <button class="tabs__btn" type="button" data-tab="pages" id="tabPages">每页 JSON</button>
+          </div>
+          <div class="tabs__panel" id="panelTree">
+            <pre class="mono" id="treeBox">{}</pre>
+          </div>
+          <div class="tabs__panel" id="panelTex" hidden>
+            <pre class="mono" id="texBox"></pre>
+          </div>
+          <div class="tabs__panel" id="panelImages" hidden>
+            <pre class="mono" id="imagesBox">[]</pre>
+          </div>
+          <div class="tabs__panel" id="panelPages" hidden>
+            <pre class="mono" id="pagesBox">[]</pre>
+          </div>
+        </div>
+      </section>
+
+      <footer class="footer">
+        <div class="footer__note" id="footerNote">
+          提示：浏览器直连 OpenAI/Anthropic/Google 常因 CORS 失败；建议使用 Cloudflare Worker 代理。
+        </div>
+      </footer>
+    </main>
+
+    <!-- pdf.js (render-only usage) -->
+    <script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.min.js"></script>
+    <!-- jszip -->
+    <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+    <script src="./app.js"></script>
+  </body>
+</html>
+
