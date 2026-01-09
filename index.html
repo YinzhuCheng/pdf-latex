@@ -358,12 +358,50 @@
           <button class="btn btn--primary" id="transcribeBtn" type="button">1) 按页转写 + 剪裁出图</button>
           <button class="btn btn--primary" id="windowAssembleBtn" type="button">2) 滑动窗口初步组装（并发）</button>
           <button class="btn btn--primary" id="organizeBtn" type="button">3) 整体组装 + 生成 main.tex</button>
+          <button class="btn btn--primary" id="repairBtn" type="button">3.5) LaTeX 修复</button>
           <button class="btn btn--primary" id="exportBtn" type="button">4) 导出最终 ZIP</button>
           <button class="btn btn--ghost" id="stopBtn" type="button">停止</button>
           <button class="btn btn--ghost" id="continueBtn" type="button">继续</button>
           <button class="btn btn--ghost" id="earlyExportBtn" type="button">早停导出</button>
           <button class="btn" id="resetBtn" type="button">重置</button>
         </div>
+
+        <details class="details" style="margin-top:12px">
+          <summary class="details__summary" id="sumRepair">LaTeX 修复选项</summary>
+          <div class="grid grid--3" style="margin-top:10px">
+            <div class="field">
+              <label class="toggle">
+                <input id="repairTheoremsEnabled" type="checkbox" />
+                <span class="toggle__label" id="lblRepairTheorems">定理环境结构化</span>
+              </label>
+              <div class="field__hint" id="hintRepairTheorems">将 \textbf{定理/定义/例} 转换为 theorem/definition/example 环境</div>
+            </div>
+            <div class="field">
+              <label class="toggle">
+                <input id="repairUseLlm" type="checkbox" />
+                <span class="toggle__label" id="lblRepairUseLlm">LLM 深度修复</span>
+              </label>
+              <div class="field__hint" id="hintRepairUseLlm">对长文本分块调用 LLM 进行深度修复（较慢）</div>
+            </div>
+            <div class="field">
+              <div class="field__label" id="lblRepairStatus">修复状态</div>
+              <div class="pill" id="repairStatus">—</div>
+            </div>
+          </div>
+          <div class="field" style="margin-top:10px">
+            <div class="field__label">修复规则说明</div>
+            <div class="field__hint" style="line-height:1.6">
+              <strong>自动修复项：</strong><br>
+              1. 文档结构：\chapter 在 ctexart 中降级为 \section<br>
+              2. 目录混淆：目录页的章节命令降级为普通文本<br>
+              3. 数学错误：\phi→\varnothing、全角符号转半角、未闭合公式<br>
+              4. 环境闭合：equation/align/figure/table 环境自动补全<br>
+              5. 图表检查：检测引用的图片是否存在<br>
+              6. 编码问题：统一引号风格<br>
+              7. 定理结构化（可选）：\textbf{定理}→theorem 环境
+            </div>
+          </div>
+        </details>
 
         <div class="progress">
           <div class="progress__row">

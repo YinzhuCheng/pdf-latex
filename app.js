@@ -353,6 +353,7 @@ function setUiBusy(isBusy) {
     "transcribeBtn",
     "windowAssembleBtn",
     "organizeBtn",
+    "repairBtn",
     "exportBtn",
     "resetBtn",
     "renderPreviewBtn",
@@ -783,6 +784,21 @@ function buildTranscriptionPrompt({ pageNum, width, height }) {
 5) 每个图像必须有唯一 ID：p${pageNum}_fig1, p${pageNum}_fig2, ...
 6) 你的 LaTeX 中必须引用这些 PNG：\\includegraphics{p${pageNum}_fig1.png} 等（文件名与 ID 对齐）。
 
+【LaTeX 可编译性要求 - 必须遵守】：
+- 数学公式：行内用 $...$，行间用 \\[...\\] 或 equation 环境，不要混用
+- 所有数学环境必须正确闭合：\\begin{...} 必须有对应的 \\end{...}
+- 空集符号用 \\varnothing 或 \\emptyset，不要用 \\phi
+- 定理/定义/例题等使用结构化环境（如有）：
+  * 定理用 \\begin{theorem}...\\end{theorem}
+  * 定义用 \\begin{definition}...\\end{definition}
+  * 例题用 \\begin{example}...\\end{example}
+  * 证明用 \\begin{proof}...\\end{proof}
+- 如果是目录页，不要输出 \\section/\\chapter 命令，只输出纯文本内容
+- 中文内容正常输出，不需要特殊处理（文档会用 ctexart）
+- 避免全角标点进入数学环境
+- figure/table 环境必须正确闭合
+- 不要输出 \\documentclass、\\begin{document} 等文档框架命令
+
 坐标系：
 - 页面像素尺寸：width=${width}, height=${height}
 - bbox 使用左上角为原点的像素坐标：{x,y,w,h}，并确保 bbox 在页面范围内。
@@ -859,6 +875,13 @@ function buildOrganizerPrompt({ windowPages }) {
 2) 如果没有足够证据，宁可不分章。
 3) latex_body 必须按页顺序包含所有页的内容（可插入 \\section 等），并保留每页边界注释。
 
+【可编译性要求】：
+- 不要在 latex_body 中包含 \\documentclass、\\begin{document}、\\end{document}
+- 章节层级必须正确：ctexart 不支持 \\chapter，请使用 \\section 作为最高级
+- 所有数学环境必须正确闭合
+- 不要重复插入相同的章节命令
+- 保持每页的 LaTeX 内容完整，不要截断环境
+
 输入 windowPages（JSON）：
 ${JSON.stringify(windowPages, null, 2)}
 `;
@@ -885,6 +908,10 @@ function buildWindowPlanPrompt({ windowPages }) {
 1) insertions 只能基于输入里 headings 的显式证据，不得新增不存在的标题。
 2) 如证据不足，宁可输出空 insertions。
 3) page 必须是窗口内页码之一。
+
+【可编译性注意】：
+- 使用 ctexart 时，level 不要使用 chapter，应使用 section 作为最高级
+- 章节层级顺序：section > subsection > subsubsection
 
 输入 windowPages（JSON）：
 ${JSON.stringify(windowPages, null, 2)}
@@ -1600,6 +1627,455 @@ async function verifyIfEnabled(mainTex) {
 }
 
 // ---------------------------
+// LaTeX Repair (rule-based, handles long text)
+// ---------------------------
+
+const LATEX_REPAIR_RULES = {
+  // 1. 文档结构错误
+  structure: [
+    {
+      name: "chapter_in_article",
+      desc: "ctexart 中不应使用 \\chapter",
+      pattern: /\\chapter\{([^}]*)\}/g,
+      fix: (match, title) => `\\section{${title}}`,
+    },
+    {
+      name: "duplicate_section_markers",
+      desc: "移除重复的章节标记",
+      pattern: /(\\section\{[^}]+\}\s*)\1+/g,
+      fix: (match, single) => single,
+    },
+  ],
+
+  // 2. 目录与正文混淆
+  toc: [
+    {
+      name: "toc_section_commands",
+      desc: "目录页的章节命令降级为文本",
+      // 匹配看起来像目录的内容（连续多个带页码的行）
+      pattern: /(%+\s*目录|\\tableofcontents)[\s\S]*?(?=\\section|\\chapter|$)/gi,
+      fix: (match) => {
+        // 将目录区域内的 \section 等替换为普通文本
+        return match
+          .replace(/\\chapter\{([^}]*)\}/g, "\\textbf{$1}")
+          .replace(/\\section\{([^}]*)\}/g, "\\textbf{$1}")
+          .replace(/\\subsection\{([^}]*)\}/g, "$1");
+      },
+    },
+  ],
+
+  // 3. 数学语法/语义错误
+  math: [
+    {
+      name: "phi_as_emptyset",
+      desc: "\\phi 作为空集应改为 \\varnothing",
+      // 只在明显表示空集的上下文中替换（如 = \\phi, \\in \\phi 等）
+      pattern: /([=∈∉⊆⊇]\s*)\\phi(?![a-zA-Z])/g,
+      fix: (match, prefix) => `${prefix}\\varnothing`,
+    },
+    {
+      name: "fullwidth_in_math",
+      desc: "数学环境中的全角符号转半角",
+      pattern: /(\$[^$]*)\uff08([^$]*\$)/g, // 全角括号
+      fix: (match, before, after) => `${before}(${after}`,
+    },
+    {
+      name: "fullwidth_comma_in_math",
+      desc: "数学环境中的全角逗号转半角",
+      pattern: /(\$[^$]*)，([^$]*\$)/g,
+      fix: (match, before, after) => `${before},${after}`,
+    },
+    {
+      name: "unclosed_inline_math",
+      desc: "修复未闭合的行内数学公式",
+      pattern: /\$([^$\n]{1,200}?)(?=\n\n|\n\\|$(?!\$))/g,
+      fix: (match, content) => {
+        // 只有当内容看起来像数学公式时才修复
+        if (/[a-zA-Z0-9+\-=\\^_{}]/.test(content) && !content.includes("$")) {
+          return `$${content}$`;
+        }
+        return match;
+      },
+    },
+  ],
+
+  // 4. 环境闭合错误
+  environments: [
+    {
+      name: "unclosed_equation",
+      desc: "修复未闭合的 equation 环境",
+      pattern: /\\begin\{equation\}([\s\S]*?)(?=\\begin\{equation\}|\\section|\\chapter|$)/g,
+      fix: (match, content) => {
+        if (!content.includes("\\end{equation}")) {
+          return `\\begin{equation}${content}\\end{equation}\n`;
+        }
+        return match;
+      },
+    },
+    {
+      name: "unclosed_align",
+      desc: "修复未闭合的 align 环境",
+      pattern: /\\begin\{align\*?\}([\s\S]*?)(?=\\begin\{align|\\section|\\chapter|$)/g,
+      fix: (match, content) => {
+        const envName = match.startsWith("\\begin{align*}") ? "align*" : "align";
+        if (!content.includes(`\\end{${envName}}`)) {
+          return `\\begin{${envName}}${content}\\end{${envName}}\n`;
+        }
+        return match;
+      },
+    },
+    {
+      name: "unclosed_figure",
+      desc: "修复未闭合的 figure 环境",
+      pattern: /\\begin\{figure\}([\s\S]*?)(?=\\begin\{figure\}|\\section|\\chapter|$)/g,
+      fix: (match, content) => {
+        if (!content.includes("\\end{figure}")) {
+          return `\\begin{figure}${content}\\end{figure}\n`;
+        }
+        return match;
+      },
+    },
+    {
+      name: "unclosed_table",
+      desc: "修复未闭合的 table 环境",
+      pattern: /\\begin\{table\}([\s\S]*?)(?=\\begin\{table\}|\\section|\\chapter|$)/g,
+      fix: (match, content) => {
+        if (!content.includes("\\end{table}")) {
+          return `\\begin{table}${content}\\end{table}\n`;
+        }
+        return match;
+      },
+    },
+  ],
+
+  // 5. 图表错误
+  figures: [
+    {
+      name: "missing_image_placeholder",
+      desc: "为缺失的图片添加占位符",
+      // 这个规则需要配合 imageList 使用，在 repairLatex 函数中特殊处理
+      pattern: null,
+      fix: null,
+    },
+    {
+      name: "hardcoded_figure_ref",
+      desc: "手写的图号提示添加注释",
+      pattern: /(图\s*\d+[\.\d]*)/g,
+      fix: (match) => `${match}% TODO: 考虑使用 \\ref`,
+    },
+  ],
+
+  // 6. 中文/编码问题
+  encoding: [
+    {
+      name: "fullwidth_period",
+      desc: "全角句号（在非数学环境）保留",
+      // 不做转换，保持中文习惯
+      pattern: null,
+      fix: null,
+    },
+    {
+      name: "mixed_quotes",
+      desc: "统一引号风格",
+      pattern: /"([^""]*)"/g,
+      fix: (match, content) => `"${content}"`,
+    },
+  ],
+
+  // 7. 定理环境结构化（可选）
+  theorems: [
+    {
+      name: "textbf_theorem",
+      desc: "\\textbf{定理} 转换为 theorem 环境",
+      pattern: /\\textbf\{定理\s*(\d*[\.\d]*)\s*\}[：:\s]*([\s\S]*?)(?=\\textbf|\\section|\\subsection|$)/g,
+      fix: (match, num, content) => {
+        const label = num ? `\\label{thm:${num.replace(/\./g, "_")}}` : "";
+        return `\\begin{theorem}${label}\n${content.trim()}\n\\end{theorem}\n`;
+      },
+    },
+    {
+      name: "textbf_definition",
+      desc: "\\textbf{定义} 转换为 definition 环境",
+      pattern: /\\textbf\{定义\s*(\d*[\.\d]*)\s*\}[：:\s]*([\s\S]*?)(?=\\textbf|\\section|\\subsection|$)/g,
+      fix: (match, num, content) => {
+        const label = num ? `\\label{def:${num.replace(/\./g, "_")}}` : "";
+        return `\\begin{definition}${label}\n${content.trim()}\n\\end{definition}\n`;
+      },
+    },
+    {
+      name: "textbf_example",
+      desc: "\\textbf{例} 转换为 example 环境",
+      pattern: /\\textbf\{例\s*(\d*[\.\d]*)\s*\}[：:\s]*([\s\S]*?)(?=\\textbf|\\section|\\subsection|\\begin\{|$)/g,
+      fix: (match, num, content) => {
+        const label = num ? `\\label{ex:${num.replace(/\./g, "_")}}` : "";
+        return `\\begin{example}${label}\n${content.trim()}\n\\end{example}\n`;
+      },
+    },
+  ],
+};
+
+function repairLatexRuleBased(latex, options = {}) {
+  const {
+    enableStructure = true,
+    enableToc = true,
+    enableMath = true,
+    enableEnvironments = true,
+    enableFigures = true,
+    enableEncoding = true,
+    enableTheorems = false, // 默认关闭定理结构化
+    imageList = [],
+  } = options;
+
+  let result = latex;
+  const fixes = [];
+
+  function applyRules(rules, category) {
+    for (const rule of rules) {
+      if (!rule.pattern || !rule.fix) continue;
+      const before = result;
+      result = result.replace(rule.pattern, rule.fix);
+      if (result !== before) {
+        fixes.push({ category, rule: rule.name, desc: rule.desc });
+      }
+    }
+  }
+
+  if (enableStructure) applyRules(LATEX_REPAIR_RULES.structure, "structure");
+  if (enableToc) applyRules(LATEX_REPAIR_RULES.toc, "toc");
+  if (enableMath) applyRules(LATEX_REPAIR_RULES.math, "math");
+  if (enableEnvironments) applyRules(LATEX_REPAIR_RULES.environments, "environments");
+  if (enableEncoding) applyRules(LATEX_REPAIR_RULES.encoding, "encoding");
+  if (enableTheorems) applyRules(LATEX_REPAIR_RULES.theorems, "theorems");
+
+  // 特殊处理：图片缺失检查
+  if (enableFigures && imageList.length > 0) {
+    const imageSet = new Set(imageList.map((img) => img.id || img.filename?.replace(/\.png$/i, "")));
+    const includedImages = [];
+    result.replace(/\\includegraphics(?:\[[^\]]*\])?\{([^}]+)\}/g, (match, filename) => {
+      const id = filename.replace(/\.png$/i, "");
+      includedImages.push(id);
+      return match;
+    });
+    for (const id of includedImages) {
+      if (!imageSet.has(id)) {
+        fixes.push({
+          category: "figures",
+          rule: "missing_image",
+          desc: `图片 ${id} 不在资源列表中`,
+        });
+      }
+    }
+  }
+
+  // 特殊处理：检查环境配对
+  const envBalance = checkEnvironmentBalance(result);
+  if (envBalance.issues.length > 0) {
+    fixes.push(...envBalance.issues.map((issue) => ({
+      category: "environments",
+      rule: "balance_check",
+      desc: issue,
+    })));
+  }
+
+  return { latex: result, fixes };
+}
+
+function checkEnvironmentBalance(latex) {
+  const issues = [];
+  const envStack = [];
+  const envRegex = /\\(begin|end)\{([^}]+)\}/g;
+  let match;
+
+  while ((match = envRegex.exec(latex)) !== null) {
+    const [, type, name] = match;
+    if (type === "begin") {
+      envStack.push({ name, pos: match.index });
+    } else if (type === "end") {
+      if (envStack.length === 0) {
+        issues.push(`多余的 \\end{${name}} (位置 ${match.index})`);
+      } else {
+        const last = envStack.pop();
+        if (last.name !== name) {
+          issues.push(`环境不匹配：\\begin{${last.name}} 与 \\end{${name}}`);
+        }
+      }
+    }
+  }
+
+  for (const unclosed of envStack) {
+    issues.push(`未闭合的 \\begin{${unclosed.name}} (位置 ${unclosed.pos})`);
+  }
+
+  return { issues };
+}
+
+function addTheoremPreamble(latex, template) {
+  // 检查是否需要添加定理环境定义
+  const needsTheorem = /\\begin\{theorem\}/.test(latex);
+  const needsDefinition = /\\begin\{definition\}/.test(latex);
+  const needsExample = /\\begin\{example\}/.test(latex);
+  const needsProof = /\\begin\{proof\}/.test(latex);
+
+  if (!needsTheorem && !needsDefinition && !needsExample) {
+    return latex;
+  }
+
+  const preambleAdditions = [];
+  if (needsTheorem || needsDefinition || needsExample) {
+    preambleAdditions.push("\\usepackage{amsthm}");
+  }
+  if (needsTheorem) {
+    preambleAdditions.push("\\newtheorem{theorem}{定理}[section]");
+  }
+  if (needsDefinition) {
+    preambleAdditions.push("\\newtheorem{definition}{定义}[section]");
+  }
+  if (needsExample) {
+    preambleAdditions.push("\\newtheorem{example}{例}[section]");
+  }
+
+  if (preambleAdditions.length === 0) return latex;
+
+  // 在 \begin{document} 之前插入
+  const insertPoint = latex.indexOf("\\begin{document}");
+  if (insertPoint === -1) return latex;
+
+  const addition = preambleAdditions.join("\n") + "\n";
+  return latex.slice(0, insertPoint) + addition + latex.slice(insertPoint);
+}
+
+async function repairLatexWithLlm(latex, options = {}) {
+  const { maxChunkSize = 8000, maxRetries = 3 } = options;
+  const verifierCfg = getRoleConfig("verifier");
+
+  // 对于长文本，分块处理
+  if (latex.length <= maxChunkSize) {
+    return await repairSingleChunk(latex, verifierCfg, maxRetries);
+  }
+
+  // 分块策略：按页面边界分割
+  const chunks = splitByPageBoundaries(latex, maxChunkSize);
+  const repairedChunks = [];
+
+  for (let i = 0; i < chunks.length; i++) {
+    setStage(`LaTeX 修复: 块 ${i + 1}/${chunks.length}`);
+    setPageProgress(`${i + 1} / ${chunks.length}`, i / chunks.length);
+    const repaired = await repairSingleChunk(chunks[i], verifierCfg, maxRetries);
+    repairedChunks.push(repaired);
+  }
+
+  return repairedChunks.join("\n");
+}
+
+function splitByPageBoundaries(latex, maxChunkSize) {
+  const chunks = [];
+  const pagePattern = /%% ===== PAGE \d+ START =====/g;
+  const matches = [...latex.matchAll(pagePattern)];
+
+  if (matches.length === 0) {
+    // 没有页面标记，按大小分割
+    for (let i = 0; i < latex.length; i += maxChunkSize) {
+      chunks.push(latex.slice(i, i + maxChunkSize));
+    }
+    return chunks;
+  }
+
+  let currentChunk = "";
+  let lastEnd = 0;
+
+  for (const match of matches) {
+    const pageStart = match.index;
+    const segment = latex.slice(lastEnd, pageStart);
+
+    if (currentChunk.length + segment.length > maxChunkSize && currentChunk.length > 0) {
+      chunks.push(currentChunk);
+      currentChunk = segment;
+    } else {
+      currentChunk += segment;
+    }
+    lastEnd = pageStart;
+  }
+
+  // 添加最后一段
+  currentChunk += latex.slice(lastEnd);
+  if (currentChunk.length > 0) {
+    chunks.push(currentChunk);
+  }
+
+  return chunks;
+}
+
+async function repairSingleChunk(chunk, cfg, maxRetries) {
+  const system = "你是 LaTeX 修复专家。只输出修复后的 LaTeX 代码，不要解释。";
+  const userText = `请修复以下 LaTeX 代码中的错误（环境未闭合、语法错误、符号错误等），保持内容不变：
+
+\`\`\`latex
+${chunk}
+\`\`\`
+
+只输出修复后的 LaTeX 代码（不要包含 \`\`\`）：`;
+
+  try {
+    const resp = await llmCallWithRetry(cfg, { system, userText, imageDataUrl: null, signal: null }, { maxRetries });
+    return stripCodeFences(resp);
+  } catch (e) {
+    log(`LLM 修复失败，使用原文: ${String(e.message || e).slice(0, 100)}`);
+    return chunk;
+  }
+}
+
+async function runLatexRepair() {
+  if (!state.mainTex) {
+    throw new Error("没有 main.tex 可修复。请先运行组装阶段。");
+  }
+
+  setStage("LaTeX 修复: 规则修复");
+  setPageProgress("—", 0);
+
+  const enableTheorems = $("repairTheoremsEnabled")?.checked || false;
+  const useLlm = $("repairUseLlm")?.checked || false;
+
+  // 1. 规则修复（快速，适合长文本）
+  const ruleResult = repairLatexRuleBased(state.mainTex, {
+    enableTheorems,
+    imageList: flattenImagesList(),
+  });
+
+  log(`规则修复完成，应用了 ${ruleResult.fixes.length} 项修复：`);
+  for (const fix of ruleResult.fixes.slice(0, 20)) {
+    log(`  - [${fix.category}] ${fix.desc}`);
+  }
+  if (ruleResult.fixes.length > 20) {
+    log(`  ... 还有 ${ruleResult.fixes.length - 20} 项`);
+  }
+
+  let finalLatex = ruleResult.latex;
+
+  // 2. 添加必要的 preamble（如定理环境）
+  if (enableTheorems) {
+    finalLatex = addTheoremPreamble(finalLatex, $("latexTemplate").value);
+  }
+
+  // 3. 可选：LLM 深度修复
+  if (useLlm) {
+    setStage("LaTeX 修复: LLM 深度修复");
+    const { maxRetries } = getRunSettings();
+    finalLatex = await repairLatexWithLlm(finalLatex, { maxRetries });
+    log("LLM 深度修复完成。");
+  }
+
+  // 4. 更新状态
+  state.mainTex = finalLatex;
+  updateOutputsPanels();
+
+  setStage("LaTeX 修复: 完成");
+  setPageProgress("100%", 1);
+  log("LaTeX 修复全部完成。");
+
+  return { fixes: ruleResult.fixes, latex: finalLatex };
+}
+
+// ---------------------------
 // Outputs + export
 // ---------------------------
 
@@ -2017,6 +2493,26 @@ function wireUi() {
     } catch (e) {
       log(String(e && e.message ? e.message : e));
       setStage("Error");
+    } finally {
+      setUiBusy(false);
+    }
+  });
+
+  $("repairBtn").addEventListener("click", async () => {
+    setUiBusy(true);
+    try {
+      const result = await runLatexRepair();
+      const statusEl = document.getElementById("repairStatus");
+      if (statusEl) {
+        setPill(statusEl, "ok", `修复 ${result.fixes.length} 项`);
+      }
+    } catch (e) {
+      log(String(e && e.message ? e.message : e));
+      setStage("Error");
+      const statusEl = document.getElementById("repairStatus");
+      if (statusEl) {
+        setPill(statusEl, "bad", "失败");
+      }
     } finally {
       setUiBusy(false);
     }
