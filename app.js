@@ -1,6 +1,6 @@
 /* eslint-disable no-console */
 
-import * as pdfjsLib from "./vendor/pdfjs/pdf.min.mjs";
+import * as pdfjsLib from "./vendor/pdfjs/pdf.min.js";
 
 // ---------------------------
 // Utilities
@@ -401,7 +401,7 @@ function setLang(lang) {
 function initPdfJs() {
   // Use vendored worker (no CDN dependency).
   // Ensure workerSrc is set before any getDocument() call.
-  pdfjsLib.GlobalWorkerOptions.workerSrc = new URL("./vendor/pdfjs/pdf.worker.min.mjs", import.meta.url).toString();
+  pdfjsLib.GlobalWorkerOptions.workerSrc = new URL("./vendor/pdfjs/pdf.worker.min.js", import.meta.url).toString();
 }
 
 async function loadPdfFromInput() {
