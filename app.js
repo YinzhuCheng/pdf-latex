@@ -1347,6 +1347,7 @@ async function buildWindowPlansConcurrently() {
   if (!pages.length) throw new Error("No per-page results yet.");
 
   const plannerCfg = getRoleConfig("planner");
+  const { maxRetries } = getRunSettings();
   const windowSize = clamp(Number($("organizerWindow").value || 7), 3, 15);
   const overlap = clamp(Number($("organizerOverlap").value || 1), 0, 5);
   const orgConc = getOrganizerConcurrency();
@@ -1365,7 +1366,7 @@ async function buildWindowPlansConcurrently() {
     });
     const system = "You are a strict JSON-only window organizer.";
     const userText = buildWindowPlanPrompt({ windowPages });
-    const resp = stripCodeFences(await llmCall(plannerCfg, { system, userText, imageDataUrl: null, signal: null }));
+    const resp = stripCodeFences(await llmCallWithRetry(plannerCfg, { system, userText, imageDataUrl: null, signal: null }, { maxRetries }));
     const parsed = safeJsonParse(resp);
     if (!parsed.ok) throw new Error(`Window plan invalid JSON (window pages ${chunk[0]}-${chunk[chunk.length - 1]}).`);
     const out = parsed.value || {};
@@ -1503,6 +1504,7 @@ async function organizeWithLlm() {
   if (!pages.length) throw new Error("No per-page results yet.");
 
   const plannerCfg = getRoleConfig("planner");
+  const { maxRetries } = getRunSettings();
   const windowSize = clamp(Number($("organizerWindow").value || 7), 3, 15);
   const overlap = clamp(Number($("organizerOverlap").value || 1), 0, 5);
   const pageChunks = chunkPages(pages, windowSize, overlap);
@@ -1524,7 +1526,7 @@ async function organizeWithLlm() {
     });
     const system = "You are a strict LaTeX organizer. Output JSON only.";
     const userText = buildOrganizerPrompt({ windowPages });
-    const resp = stripCodeFences(await llmCall(plannerCfg, { system, userText, imageDataUrl: null }));
+    const resp = stripCodeFences(await llmCallWithRetry(plannerCfg, { system, userText, imageDataUrl: null, signal: null }, { maxRetries }));
     const parsed = safeJsonParse(resp);
     if (!parsed.ok) throw new Error(`Organizer LLM returned invalid JSON (window ${ci + 1}).`);
     const out = parsed.value;
@@ -1586,11 +1588,12 @@ async function organizeWithLlm() {
 async function verifyIfEnabled(mainTex) {
   if (!$("verifierEnabled").checked) return { latex_compiles_syntax: null, issues: [] };
   const verifierCfg = getRoleConfig("verifier");
+  const { maxRetries } = getRunSettings();
   setStage("Verify: LLM check");
   const images = flattenImagesList();
   const system = "You are a strict JSON-only verifier.";
   const userText = buildVerifierPrompt({ mainTex, images });
-  const resp = stripCodeFences(await llmCall(verifierCfg, { system, userText, imageDataUrl: null }));
+  const resp = stripCodeFences(await llmCallWithRetry(verifierCfg, { system, userText, imageDataUrl: null, signal: null }, { maxRetries }));
   const parsed = safeJsonParse(resp);
   if (!parsed.ok) throw new Error("Verifier returned invalid JSON.");
   return parsed.value;
